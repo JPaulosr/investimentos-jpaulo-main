@@ -28,3 +28,6 @@ yfinance
 beautifulsoup4
 requests
 lxml
+requests>=2.31.0
+gspread>=6.0.0
+google-auth>=2.25.0

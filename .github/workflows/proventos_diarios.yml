@@ -2,7 +2,7 @@ name: Proventos Diários
 
 on:
   schedule:
-    - cron: "0 9 * * *"   # todo dia às 09:00 UTC
+    - cron: "0 9 * * *"  # todo dia às 09:00 UTC (06:00 Brasil UTC-3)
   workflow_dispatch:
 
 jobs:
@@ -24,5 +24,16 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Executar robô de proventos
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+          # Google Sheets (opcional, mas recomendado)
+          GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
+          SHEET_ID_NOVO: ${{ secrets.SHEET_ID_NOVO }}
+
+          # Ajustes do alerta
+          LOOKAHEAD_DAYS: "30"
+          TZ_OFFSET_HOURS: "-3"
         run: |
           python alerts/proventos_diarios.py
