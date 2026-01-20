@@ -5,7 +5,8 @@
 # - Detecta linha de cabeçalho por palavras-chave
 # - Normaliza rótulos (acentos/quebras) e padroniza colunas
 # - [NOVO] Busca cotações online com yfinance
-# - [NOVO] Calcula P/L % e YOC % por ativ
+# - [NOVO] Calcula P/L % e YOC % por ativo
+# - [NOVO] Adiciona KPIs de P/L % e Renda Projetada
 
 import streamlit as st
 import pandas as pd
