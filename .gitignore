@@ -21,3 +21,8 @@ venv/
 Thumbs.db
 .vscode/
 .idea/
+
+# --- NÃO PUBLICAR CONTRATOS / DOCUMENTOS INTERNOS ---
+docs/MB_CONTRATO_SISTEMA_INVESTIMENTOS_v1.md
+docs/*CONTRATO*
+docs/*contrato*
