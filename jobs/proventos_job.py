@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ROBÔ PROVENTOS — versão robusta (idempotente + update + soft delete)
-INTEGRADA COM FETCH REAL
+INTEGRADA COM FETCH REAL + CORREÇÃO DE BUGS
 """
 
 from __future__ import annotations
@@ -158,10 +158,6 @@ def _ensure_sheet_with_header(sh, title, header, rows=1000, cols=20):
         ws.append_row(header, value_input_option="USER_ENTERED")
         return ws
     
-    # Check headers
-    cur = [str(c).strip().lower() for c in vals[0]]
-    want = [str(c).strip().lower() for c in header]
-    # Se faltar coluna critica, avisa (ou adiciona logica de append, simplificado aqui)
     return ws
 
 def _ensure_columns(ws, required_cols):
@@ -173,7 +169,7 @@ def _ensure_columns(ws, required_cols):
     to_add = [c for c in required_cols if c.lower() not in header_lower]
     if to_add:
         new_header = header + to_add
-        ws.update("1:1", [new_header])
+        ws.update(range_name="1:1", values=[new_header])
         return new_header
     return header
 
@@ -202,12 +198,9 @@ def _send_telegram(msg: str) -> None:
     except: pass
 
 # =============================================================================
-# FETCH REAL (AGORA CONECTADO)
+# FETCH REAL
 # =============================================================================
 def fetch_events(sh: gspread.Spreadsheet) -> List[Dict[str, Any]]:
-    """
-    Lê a carteira da aba 'ativos_master' e busca proventos reais na internet.
-    """
     print("🔎 Lendo ativos para monitorar...")
     try:
         ws_ativos = sh.worksheet(ABA_ATIVOS)
@@ -224,14 +217,12 @@ def fetch_events(sh: gspread.Spreadsheet) -> List[Dict[str, Any]]:
     for t in tickers:
         if not t: continue
         try:
-            # Chama o motor de busca que já existia no projeto
             resultados = fetch_provento_anunciado(t)
             
             for item in resultados:
-                # Normaliza para o formato esperado pelo robô
                 evt = {
                     "ticker": t,
-                    "tipo_ativo": "", # O fetch não retorna isso, mas tudo bem
+                    "tipo_ativo": "",
                     "status": "ANUNCIADO",
                     "tipo_pagamento": item.get("tipo_pagamento", "RENDIMENTO"),
                     "data_com": item.get("data_com", ""),
@@ -243,7 +234,6 @@ def fetch_events(sh: gspread.Spreadsheet) -> List[Dict[str, Any]]:
                 }
                 novos_eventos.append(evt)
             
-            # Pausa para não bloquear
             time.sleep(0.5)
             
         except Exception as e:
@@ -276,7 +266,7 @@ def run() -> None:
     header = _ensure_columns(ws_anun, required_cols=["event_id", "ativo", "atualizado_em", "version_hash"])
     hmap = _col_idx_map(header)
 
-    # 3) Carrega índices para saber o que já existe
+    # 3) Carrega índices
     print("📚 Indexando base existente...")
     all_vals = ws_anun.get_all_values()
     
@@ -288,9 +278,8 @@ def run() -> None:
     idx_version = hmap.get("version_hash")
     idx_ativo = hmap.get("ativo")
 
-    # Mapeia linha a linha (row_index começa em 1, mas header é 1, dados 2)
     for ridx, row in enumerate(all_vals, start=1):
-        if ridx == 1: continue # Pula header
+        if ridx == 1: continue 
         
         eid = ""
         if idx_event_id and idx_event_id <= len(row):
@@ -303,7 +292,7 @@ def run() -> None:
             if idx_ativo and idx_ativo <= len(row):
                 existing_ativo[eid] = str(row[idx_ativo - 1]).strip()
 
-    # 4) FETCH REAL (Passando a planilha para ler os tickers)
+    # 4) FETCH REAL
     eventos = fetch_events(sh)
     
     if not eventos:
@@ -323,7 +312,6 @@ def run() -> None:
     log_rows = []
 
     for ev in eventos:
-        # Normalização dos dados de entrada
         row_norm = {
             "ticker": _norm_ticker(ev.get("ticker")),
             "tipo_ativo": str(ev.get("tipo_ativo", "")).strip(),
@@ -340,7 +328,6 @@ def run() -> None:
         if not row_norm["ticker"] or not row_norm["tipo_pagamento"] or not row_norm["data_com"]:
             continue
 
-        # Gera IDs únicos
         eid = event_id_from_row(row_norm)
         vhash = event_version_fingerprint(row_norm)
         
@@ -349,9 +336,8 @@ def run() -> None:
         row_norm["atualizado_em"] = _now_iso_min()
         row_norm["version_hash"] = vhash
 
-        # --- Lógica de INSERT ---
+        # INSERT
         if eid not in existing_by_event_id:
-            # Prepara nova linha alinhada com o header
             out = [""] * len(header)
             def setc(col, val):
                 j = hmap.get(col.lower())
@@ -362,9 +348,8 @@ def run() -> None:
             
             append_rows.append(out)
             inserted += 1
-            existing_by_event_id[eid] = -1 # Marcador para não duplicar no mesmo loop
+            existing_by_event_id[eid] = -1 
 
-            # Notifica Telegram se for novidade
             if vhash not in hashes_enviados:
                 hashes_enviados.add(vhash)
                 log_rows.append([_now_iso_min(), vhash, row_norm["ticker"], "ANUNCIADO", row_norm["status"]])
@@ -379,22 +364,22 @@ def run() -> None:
                 telegram_sent += 1
             continue
 
-        # --- Lógica de UPDATE ---
+        # UPDATE
         sheet_row = existing_by_event_id[eid]
         prev_vhash = existing_version_hash.get(eid, "")
         prev_ativo = str(existing_ativo.get(eid, "")).strip()
 
-        # Reativar se estava 'soft deleted'
+        # Reativar (soft delete)
         if prev_ativo in ("0", "False", "false", ""):
             try:
-                ws_anun.update(_cell_a1(hmap["ativo"], sheet_row), [[1]])
+                # CORREÇÃO DE DEPRECATION E NOME DE VARIÁVEL
+                ws_anun.update(range_name=_cell_a1(hmap["ativo"], sheet_row), values=[[1]])
                 reactivated += 1
                 existing_ativo[eid] = "1"
             except: pass
 
-        # Se versão mudou (ex: data pagamento mudou), atualiza
+        # Se mudou valor ou data
         if prev_vhash != vhash:
-            # Lista de atualizações
             updates = [
                 ("status", row_norm["status"]),
                 ("data_pagamento", row_norm["data_pagamento"]),
@@ -409,13 +394,13 @@ def run() -> None:
                 if cidx:
                     val_safe = "" if val is None else val
                     try:
-                        ws_anun.update(_cell_a1(cidx, sheet_row), [[val_safe]])
+                        # CORREÇÃO DE DEPRECATION E NOME DE VARIÁVEL
+                        ws_anun.update(range_name=_cell_a1(cidx, sheet_row), values=[[val_safe]])
                     except: pass
             
             existing_version_hash[eid] = vhash
             updated += 1
             
-            # Notifica alteração
             if vhash not in hashes_enviados:
                 hashes_enviados.add(vhash)
                 log_rows.append([_now_iso_min(), vhash, row_norm["ticker"], "UPDATE", "Atualizado"])
@@ -428,10 +413,11 @@ def run() -> None:
                 _send_telegram(msg)
                 telegram_sent += 1
 
-    # 6) Gravação em Lote
+    # 6) Gravação em Lote (CORREÇÃO DA VARIÁVEL AQUI)
     if append_rows:
         print(f"💾 Salvando {len(append_rows)} novos registros...")
-        ws_anunciados.append_rows(append_rows, value_input_option="USER_ENTERED")
+        # AQUI ESTAVA O ERRO: era ws_anunciados, corrigido para ws_anun
+        ws_anun.append_rows(append_rows, value_input_option="USER_ENTERED")
     
     if log_rows:
         ws_logs.append_rows(log_rows, value_input_option="USER_ENTERED")
