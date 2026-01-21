@@ -1,39 +1,35 @@
-name: Proventos Diários
+name: Robô Proventos (Diário 09h)
 
 on:
   schedule:
-    - cron: "0 9 * * *"  # todo dia às 09:00 UTC (06:00 Brasil UTC-3)
+    # 12:00 UTC = 09:00 Brasil
+    - cron: "0 12 * * *"
   workflow_dispatch:
 
 jobs:
-  run-alerts:
+  run-robot:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout do repositório
+      - name: Checkout Código
         uses: actions/checkout@v4
 
-      - name: Configurar Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Instalar dependências
+      - name: Instalar Dependências
+        # Instala requests, pandas, gspread E beautifulsoup4 (necessário pro seu utils)
         run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install requests pandas gspread google-auth beautifulsoup4
 
-      - name: Executar robô de proventos
+      - name: Executar Robô
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-
-          # Google Sheets (opcional, mas recomendado)
+          # Seus segredos já configurados
           GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
           SHEET_ID_NOVO: ${{ secrets.SHEET_ID_NOVO }}
-
-          # Ajustes do alerta
-          LOOKAHEAD_DAYS: "30"
-          TZ_OFFSET_HOURS: "-3"
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python alerts/proventos_diarios.py
+          python jobs/proventos_job.py

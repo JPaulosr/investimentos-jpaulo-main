@@ -1,2 +1,8 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Normaliza tudo e FORÇA LF no repositório
+* text=auto eol=lf
+
+# Linguagens/arquivos críticos sempre LF
+*.py   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.md   text eol=lf
