@@ -9,6 +9,7 @@ from datetime import datetime, date
 import gspread
 from google.oauth2.service_account import Credentials
 import requests
+from collections import defaultdict
 
 # Ajuste de path para utils
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -20,7 +21,6 @@ except ImportError:
 
 # --- CONFIGURAÇÃO ---
 SHEET_ID = (os.getenv("SHEET_ID_NOVO") or os.getenv("SHEET_ID") or "").strip()
-
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GCP_JSON = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
@@ -28,16 +28,16 @@ GCP_JSON = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
 ABA_ATIVOS = "ativos_master"
 ABA_ANUNCIADOS = "proventos_anunciados"
 ABA_LOGS = "alerts_log"
-ABA_POSICOES = "posicoes_snapshot" # Onde lemos a quantidade
+ABA_POSICOES = "posicoes_snapshot"
+
+MAX_DAYS_ALERT = 120 
 
 def _get_client():
     if not GCP_JSON:
         raise RuntimeError("❌ GCP_SERVICE_ACCOUNT_JSON não definido.")
-    
     info = json.loads(GCP_JSON)
     if "private_key" in info:
         info["private_key"] = info["private_key"].replace("\\n", "\n")
-        
     creds = Credentials.from_service_account_info(
         info, scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     )
@@ -59,103 +59,81 @@ def _safe_float(val):
     except:
         return 0.0
 
+def _normalize_date(val):
+    """
+    RÉGUA DA PÁGINA MANUAL:
+    Garante formato YYYY-MM-DD para comparação exata com o que a página salva.
+    """
+    s = str(val).strip()
+    if not s: return ""
+    try:
+        # Se vier 31/01/2026 (formato PT-BR do Sheets/Streamlit)
+        return datetime.strptime(s, "%d/%m/%Y").strftime("%Y-%m-%d")
+    except:
+        pass
+    try:
+        # Se já vier 2026-01-31 (formato ISO)
+        return datetime.strptime(s, "%Y-%m-%d").strftime("%Y-%m-%d")
+    except:
+        return s 
+
 def _get_carteira_qtd(sh):
-    """
-    Tenta ler a quantidade de cotas da aba 'posicoes_snapshot' ou 'ativos_master'.
-    Retorna um dicionário: {'PETR4': 100.0, 'VALE3': 50.0}
-    """
     carteira = {}
     try:
-        # Tenta posicoes_snapshot primeiro (ideal)
-        try:
-            ws = sh.worksheet(ABA_POSICOES)
-        except:
-            # Fallback para ativos_master se tiver coluna de quantidade
-            ws = sh.worksheet(ABA_ATIVOS)
-            
+        try: ws = sh.worksheet(ABA_POSICOES)
+        except: ws = sh.worksheet(ABA_ATIVOS)
         records = ws.get_all_records()
         for r in records:
-            # Tenta achar a chave do ticker e da quantidade (pode variar o nome)
-            tk = str(r.get('ticker') or r.get('ativo') or r.get('papel') or '').strip().upper()
-            qtd = _safe_float(r.get('quantidade') or r.get('qtd') or r.get('saldo') or r.get('total') or 0)
-            
+            tk = str(r.get('ticker') or r.get('ativo') or '').strip().upper()
+            qtd = _safe_float(r.get('quantidade') or r.get('qtd') or r.get('saldo') or 0)
             if tk and qtd > 0:
                 carteira[tk] = qtd
-                
-        print(f"💰 Carteira carregada: {len(carteira)} ativos com saldo.")
-    except Exception as e:
-        print(f"⚠️ Não foi possível ler saldo da carteira: {e}")
-        
+    except: pass
     return carteira
 
 def run():
-    print("🚀 Iniciando Robô (Anti-Spam + Pagamento Hoje)...")
-    
-    if not SHEET_ID:
-        raise RuntimeError("❌ ERRO: SHEET_ID vazio.")
+    print("🚀 Iniciando Robô (Sincronizado com Página Manual)...")
+    if not SHEET_ID: raise RuntimeError("❌ SHEET_ID vazio.")
 
     gc = _get_client()
     sh = gc.open_by_key(SHEET_ID)
-
     ws_anunciados = sh.worksheet(ABA_ANUNCIADOS)
     ws_ativos = sh.worksheet(ABA_ATIVOS)
-    
-    try:
-        ws_logs = sh.worksheet(ABA_LOGS)
-    except:
-        ws_logs = sh.add_worksheet(ABA_LOGS, rows=1000, cols=5)
-        ws_logs.append_row(["timestamp", "event_hash", "ticker", "tipo", "mensagem"])
+    try: ws_logs = sh.worksheet(ABA_LOGS)
+    except: ws_logs = sh.add_worksheet(ABA_LOGS, rows=1000, cols=5)
 
-    # 1. Carregar Carteira (Quantidades)
     carteira_qtd = _get_carteira_qtd(sh)
+    hoje_date = datetime.now().date()
+    hoje_iso = hoje_date.strftime("%Y-%m-%d")
+    
+    pagamentos_hoje_queue = []
+    novos_anuncios_dict = defaultdict(list)
 
-    # 2. Mapeamento de Existentes (Evitar Duplicatas)
+    # 1. Carrega Base Existente (Usando a Régua da Página)
+    print("📋 Mapeando registros existentes...")
     exist_records = ws_anunciados.get_all_records()
     existing_keys = set()
     
-    # Prepara verificação de PAGAMENTO HOJE
-    hoje_iso = datetime.now().strftime("%Y-%m-%d")
-    pagamentos_hoje_queue = []
-
     for r in exist_records:
-        val_float = _safe_float(r.get('valor_por_cota'))
-        val_str = f"{val_float:.4f}"
+        val = _safe_float(r.get('valor_por_cota'))
         tk = str(r.get('ticker')).strip().upper()
-        dp = str(r.get('data_pagamento'))
+        # Normalização CRÍTICA: Mesma lógica da página manual
+        dp = _normalize_date(r.get('data_pagamento'))
         
-        # Chave única para o banco
-        key = f"{tk}|{dp}|{val_str}"
+        # Chave única: Ticker + DataPagamento + Valor
+        key = f"{tk}|{dp}|{val:.4f}"
         existing_keys.add(key)
         
-        # --- LÓGICA DE PAGAMENTO HOJE ---
-        # Se a data de pagamento for HOJE, calcula e prepara alerta
-        if dp == hoje_iso and val_float > 0:
-            qtd_ref = _safe_float(r.get('quantidade_ref', 0)) # Se tiver congelado
-            if qtd_ref <= 0:
-                qtd_ref = carteira_qtd.get(tk, 0.0) # Se não, pega da posição atual
-                fonte_qtd = "Posição Atual"
-            else:
-                fonte_qtd = "Qtd Ref (Congelada)"
-            
-            if qtd_ref > 0:
-                total_receber = qtd_ref * val_float
-                msg_pag = (
-                    f"💰 <b>Pagamento Hoje: {tk}</b>\n"
-                    f"Qtd: {qtd_ref:g} cotas\n"
-                    f"Valor/cota: R$ {val_float:,.2f}\n"
-                    f"<b>Total: R$ {total_receber:,.2f}</b>\n"
-                    f"<i>({fonte_qtd})</i>"
-                )
-                pagamentos_hoje_queue.append((msg_pag, tk))
+        # Check Pagamento Hoje (Base Antiga)
+        if dp == hoje_iso and val > 0:
+            _processa_pagamento_hoje(tk, val, r.get('quantidade_ref'), carteira_qtd, pagamentos_hoje_queue)
 
-    # 3. Fetch Novos Anúncios
+    # 2. Fetch Novos
     ativos_raw = ws_ativos.get_all_records()
     tickers = list(set([str(r['ticker']).strip().upper() for r in ativos_raw if r.get('ticker')]))
-    print(f"🔎 Monitorando {len(tickers)} ativos.")
-
     rows_to_save = []
-    novos_anuncios_lines = []
     
+    print(f"🔎 Verificando {len(tickers)} ativos...")
     for t in tickers:
         try:
             res = fetch_provento_anunciado(t)
@@ -166,66 +144,111 @@ def run():
                 tk = str(item.get('ticker')).upper()
                 tp = str(item.get('tipo_pagamento', 'RENDIMENTO')).upper()
                 dc = str(item.get('data_com', ''))
-                dp = str(item.get('data_pagamento', ''))
+                # Normaliza a data que vem do site também
+                dp_site = str(item.get('data_pagamento', ''))
+                dp_norm = _normalize_date(dp_site) 
+                
                 url = str(item.get('fonte_url', ''))
                 
-                val_check = f"{val:.4f}"
-                check_key = f"{tk}|{dp}|{val_check}"
+                # AQUI ESTÁ A MÁGICA: Compara usando a mesma chave da página manual
+                check_key = f"{tk}|{dp_norm}|{val:.4f}"
                 
                 if check_key not in existing_keys:
-                    print(f"✨ NOVO: {tk} R$ {val}")
+                    print(f"✨ NOVO: {tk} R$ {val} ({dp_norm})")
                     
-                    # Colunas fixas (A-K)
-                    new_row = [
-                        tk, "", "ANUNCIADO", tp, dc, dp, val, 
-                        "", url, datetime.now().strftime("%Y-%m-%d %H:%M"), "Robô GitHub"
-                    ]
-                    
-                    rows_to_save.append(new_row)
+                    # Salva nas colunas A-K (igual à página manual)
+                    rows_to_save.append([
+                        tk,                 # ticker
+                        "",                 # tipo_ativo (vazio)
+                        "ANUNCIADO",        # status
+                        tp,                 # tipo_pagamento
+                        dc,                 # data_com
+                        dp_norm,            # data_pagamento (NORMALIZADA)
+                        val,                # valor_por_cota
+                        "",                 # quantidade_ref
+                        url,                # fonte_url
+                        datetime.now().strftime("%Y-%m-%d %H:%M"), # capturado_em
+                        "Robô GitHub"       # fonte_nome
+                    ])
                     existing_keys.add(check_key)
                     
-                    # Adiciona ao resumo
-                    novos_anuncios_lines.append(f"• <b>{tk}</b> ({tp}): R$ {val:,.2f} | Pag: {dp}")
-
+                    # Check Pagamento Hoje (Base Nova)
+                    if dp_norm == hoje_iso:
+                        _processa_pagamento_hoje(tk, val, 0, carteira_qtd, pagamentos_hoje_queue)
+                    else:
+                        # Filtro de Ansiedade
+                        try:
+                            dt_pag_obj = datetime.strptime(dp_norm, "%Y-%m-%d").date()
+                            dias_ate_pag = (dt_pag_obj - hoje_date).days
+                            if 0 <= dias_ate_pag <= MAX_DAYS_ALERT:
+                                novos_anuncios_dict[tk].append({'val': val, 'dp': dp_norm, 'tp': tp})
+                        except:
+                            novos_anuncios_dict[tk].append({'val': val, 'dp': dp_norm, 'tp': tp})
             time.sleep(0.5)
         except Exception as e:
-            print(f"⚠️ Erro ao ler {t}: {e}")
+            print(f"⚠️ {t}: {e}")
 
-    # 4. Salvar Novos
+    # 3. Persistência
     if rows_to_save:
-        print(f"💾 Salvando {len(rows_to_save)} novos registros...")
+        print(f"💾 Salvando {len(rows_to_save)} registros...")
         ws_anunciados.append_rows(rows_to_save, value_input_option="USER_ENTERED")
+    else:
+        print("✅ Tudo sincronizado. Nenhuma novidade.")
 
-    # 5. Enviar Alertas (Logica de Logs para não repetir)
+    # 4. Alertas (Logs para não repetir envio)
     logs_existentes = ws_logs.get_all_records()
     hashes_enviados = set(str(r.get('event_hash')) for r in logs_existentes)
     logs_to_append = []
 
-    # A) Alertas de Novos Anúncios (Agrupado)
-    if novos_anuncios_lines:
-        header = "📢 <b>Novos Proventos Anunciados</b>\n\n"
-        body = "\n".join(novos_anuncios_lines)
-        full_msg = header + body
-        msg_hash = _generate_hash(full_msg)
-        
-        if msg_hash not in hashes_enviados:
-            _send_telegram(full_msg)
-            logs_to_append.append([datetime.now().strftime("%Y-%m-%d %H:%M"), msg_hash, "LOTE", "ANUNCIO", "Resumo Enviado"])
-            print("📢 Resumo de anúncios enviado.")
-
-    # B) Alertas de Pagamento Hoje (Individual e Detalhado)
+    # A) Pagamentos Hoje
     for msg, tk in pagamentos_hoje_queue:
-        ph_hash = _generate_hash(msg + datetime.now().strftime("%Y-%m-%d")) # Hash único do dia
-        
+        ph_hash = _generate_hash(msg + hoje_iso)
         if ph_hash not in hashes_enviados:
             _send_telegram(msg)
             logs_to_append.append([datetime.now().strftime("%Y-%m-%d %H:%M"), ph_hash, tk, "PAGAMENTO_HOJE", "Enviado"])
-            print(f"💰 Aviso de pagamento enviado para {tk}")
             time.sleep(0.5)
 
-    # Salva logs
+    # B) Novos Anúncios
+    if novos_anuncios_dict:
+        lines = []
+        for tk, itens in novos_anuncios_dict.items():
+            if len(itens) > 2:
+                vals = [i['val'] for i in itens]
+                datas = sorted([i['dp'] for i in itens])
+                lines.append(f"• <b>{tk}</b>: {len(itens)} eventos\n   R$ {min(vals):,.2f} a R$ {max(vals):,.2f}\n   Pag: {datas[0]} até {datas[-1]}")
+            else:
+                for i in itens:
+                    lines.append(f"• <b>{tk}</b> ({i['tp']}): R$ {i['val']:,.2f} | Pag: {i['dp']}")
+        
+        if lines:
+            full_msg = "📢 <b>Novos Proventos Anunciados</b>\n\n" + "\n".join(lines)
+            msg_hash = _generate_hash(full_msg)
+            if msg_hash not in hashes_enviados:
+                _send_telegram(full_msg)
+                logs_to_append.append([datetime.now().strftime("%Y-%m-%d %H:%M"), msg_hash, "LOTE", "ANUNCIO", "Resumo"])
+
     if logs_to_append:
         ws_logs.append_rows(logs_to_append, value_input_option="USER_ENTERED")
+
+def _processa_pagamento_hoje(tk, val, qtd_ref_raw, carteira, queue):
+    try:
+        qtd_ref = _safe_float(qtd_ref_raw)
+        fonte = "Qtd Congelada"
+        if qtd_ref <= 0:
+            qtd_ref = carteira.get(tk, 0.0)
+            fonte = "Posição Atual"
+        
+        if qtd_ref > 0:
+            total = qtd_ref * val
+            msg = (
+                f"💰 <b>Pagamento Hoje: {tk}</b>\n"
+                f"Qtd: {qtd_ref:g}\n"
+                f"Valor/cota: R$ {val:,.2f}\n"
+                f"<b>Total: R$ {total:,.2f}</b>\n"
+                f"<i>({fonte})</i>"
+            )
+            queue.append((msg, tk))
+    except: pass
 
 if __name__ == "__main__":
     run()
