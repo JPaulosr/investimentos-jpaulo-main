@@ -445,11 +445,19 @@ def run() -> None:
             if vhash not in hashes_enviados:
                 hashes_enviados.add(vhash)
                 log_rows.append([_now_iso_min(), vhash, row_norm["ticker"], "ANUNCIADO", row_norm["status"]])
+                # prepara texto do valor (NUNCA f-string dentro de f-string)
+                if row_norm["valor_por_cota"] is None:
+                    valor_txt = "-"
+                else:
+                    valor_txt = f"R$ {row_norm['valor_por_cota']:.4f}"
+
                 _send_telegram(
-                    f"📌 Provento anunciado (NOVO)\n{row_norm['ticker']} — {row_norm['tipo_pagamento']}\n"
+                    f"📌 Provento anunciado (NOVO)\n"
+                    f"{row_norm['ticker']} — {row_norm['tipo_pagamento']}\n"
                     f"Com: {row_norm['data_com']} | Pag: {row_norm['data_pagamento'] or '-'}\n"
-                    f"Valor/cota: {('-' if row_norm['valor_por_cota'] is None else f'R$ {row_norm['valor_por_cota']:.4f}')}"
+                    f"Valor/cota: {valor_txt}"
                 )
+
                 telegram_sent += 1
             continue
 
@@ -500,11 +508,19 @@ def run() -> None:
         if vhash not in hashes_enviados:
             hashes_enviados.add(vhash)
             log_rows.append([_now_iso_min(), vhash, row_norm["ticker"], "UPDATE", row_norm["status"]])
+            # prepara texto do valor (NUNCA f-string dentro de f-string)
+            if row_norm["valor_por_cota"] is None:
+                valor_txt = "-"
+            else:
+                valor_txt = f"R$ {row_norm['valor_por_cota']:.4f}"
+
             _send_telegram(
-                f"🔁 Provento anunciado (ATUALIZADO)\n{row_norm['ticker']} — {row_norm['tipo_pagamento']}\n"
+                f"📌 Provento anunciado (NOVO)\n"
+                f"{row_norm['ticker']} — {row_norm['tipo_pagamento']}\n"
                 f"Com: {row_norm['data_com']} | Pag: {row_norm['data_pagamento'] or '-'}\n"
-                f"Valor/cota: {('-' if row_norm['valor_por_cota'] is None else f'R$ {row_norm['valor_por_cota']:.4f}')}"
+                f"Valor/cota: {valor_txt}"
             )
+
             telegram_sent += 1
 
     # 6) grava batch de inserts
