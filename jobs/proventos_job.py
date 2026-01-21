@@ -397,6 +397,9 @@ def run() -> None:
 
     # 3) lê valores já com layout correto
     all_vals = ws_anun.get_all_values()
+    # ================================
+    # MAPEAR ESTADO ATUAL DA PLANILHA
+    # ================================
     existing_by_event_id: Dict[str, int] = {}
     existing_version_hash: Dict[str, str] = {}
     existing_ativo: Dict[str, str] = {}
@@ -407,51 +410,36 @@ def run() -> None:
 
     for ridx in range(2, len(all_vals) + 1):
         row = all_vals[ridx - 1]
-        eid = str(row[idx_event_id - 1]).strip() if idx_event_id - 1 < len(row) else ""
-        if eid:
-            existing_by_event_id[eid] = ridx
-            existing_version_hash[eid] = str(row[idx_version - 1]).strip() if idx_version - 1 < len(row) else ""
-            existing_ativo[eid] = str(row[idx_ativo - 1]).strip() if idx_ativo - 1 < len(row) else ""
 
-    logs_records = _safe_get_records(ws_logs)
-    hashes_enviados = {str(r.get("event_hash") or "").strip() for r in logs_records if r.get("event_hash")}
+        eid = ""
+        if idx_event_id - 1 < len(row):
+            eid = str(row[idx_event_id - 1]).strip()
 
-    eventos = fetch_events_from_master(sh)
-    if not eventos:
-        print("ℹ️ Nenhum evento retornado pelo fetch. Nada a fazer.")
-        return
+        if not eid:
+            continue
 
-    inserted = 0
-    updated = 0
-    reactivated = 0
-    telegram_sent = 0
-    log_rows: List[List[Any]] = []
-    append_rows: List[List[Any]] = []
+        existing_by_event_id[eid] = ridx
 
-    def make_row_out(row_norm: Dict[str, Any]) -> List[Any]:
-        out = [""] * len(header)
+        if idx_version - 1 < len(row):
+            existing_version_hash[eid] = str(row[idx_version - 1]).strip()
+        else:
+            existing_version_hash[eid] = ""
 
-        def setc(col: str, val: Any):
-            j = hmap.get(col.strip().lower())
-            if j:
-                out[j - 1] = "" if val is None else val
+        if idx_ativo - 1 < len(row):
+            existing_ativo[eid] = str(row[idx_ativo - 1]).strip()
+        else:
+            existing_ativo[eid] = ""
 
-        setc("ticker", row_norm["ticker"])
-        setc("tipo_ativo", row_norm["tipo_ativo"])
-        setc("status", row_norm["status"])
-        setc("tipo_pagamento", row_norm["tipo_pagamento"])
-        setc("data_com", row_norm["data_com"])
-        setc("data_pagamento", row_norm["data_pagamento"])
-        setc("valor_por_cota", "" if row_norm["valor_por_cota"] is None else row_norm["valor_por_cota"])
-        setc("quantidade_ref", row_norm["quantidade_ref"])
-        setc("fonte_url", row_norm["fonte_url"])
-        setc("capturado_em", row_norm["capturado_em"])
-        setc("event_id", row_norm["event_id"])
-        setc("ativo", row_norm["ativo"])
-        setc("atualizado_em", row_norm["atualizado_em"])
-        setc("version_hash", row_norm["version_hash"])
-        return out
 
+    # ==================================================
+    # ✅ ACUMULADOR DE UPDATES (BATCH WRITE)
+    # ==================================================
+    cell_updates: List[Dict[str, Any]] = []
+
+
+    # ==================================================
+    # LOOP PRINCIPAL DE EVENTOS
+    # ==================================================
     for ev in eventos:
         row_norm: Dict[str, Any] = {
             "ticker": _norm_ticker(ev.get("ticker", "")),
@@ -466,6 +454,7 @@ def run() -> None:
             "capturado_em": str(ev.get("capturado_em", "") or _now_iso_min()),
         }
 
+        # mínimos obrigatórios
         if not row_norm["ticker"] or not row_norm["tipo_pagamento"] or not row_norm["data_com"]:
             continue
 
@@ -480,7 +469,9 @@ def run() -> None:
         valor = row_norm["valor_por_cota"]
         valor_txt = "-" if valor is None else f"R$ {valor:.4f}"
 
+        # ==================================================
         # INSERT
+        # ==================================================
         if eid not in existing_by_event_id:
             append_rows.append(make_row_out(row_norm))
             inserted += 1
@@ -498,76 +489,44 @@ def run() -> None:
                 telegram_sent += 1
             continue
 
-        # UPDATE
+        # ==================================================
+        # UPDATE (BATCH — NÃO ESCREVE AQUI)
+        # ==================================================
         sheet_row = existing_by_event_id[eid]
         prev_vhash = existing_version_hash.get(eid, "")
-        prev_ativo = (existing_ativo.get(eid, "") or "").strip()
+        prev_ativo = existing_ativo.get(eid, "").strip()
 
-        # reativa se estava soft delete
+        # reativar soft delete
         if prev_ativo in ("0", "False", "false", ""):
-            try:
-                ws_anun.update(_cell_a1(hmap["ativo"], sheet_row), [[1]])
-                reactivated += 1
-                existing_ativo[eid] = "1"
-            except Exception:
-                pass
+            cell_updates.append({
+                "range": _cell_a1(hmap["ativo"], sheet_row),
+                "values": [[1]],
+            })
+            existing_ativo[eid] = "1"
+            reactivated += 1
 
-        # se a versão é igual, ainda assim “cura” colunas estáveis se estiverem vazias
-        # (isso repara linhas legadas que só tinham hashes)
-        # Vamos ler a linha atual para ver vazios.
-        try:
-            current_row = ws_anun.row_values(sheet_row)
-        except Exception:
-            current_row = []
-
-        def _cell_value(colname: str) -> str:
-            idx = hmap[colname] - 1
-            return str(current_row[idx]).strip() if idx < len(current_row) else ""
-
-        # Preenche sempre campos estáveis se estiverem vazios (cura legado)
-        stable_fill: List[Tuple[str, Any]] = []
-        if not _cell_value("ticker"):
-            stable_fill.append(("ticker", row_norm["ticker"]))
-        if not _cell_value("tipo_pagamento"):
-            stable_fill.append(("tipo_pagamento", row_norm["tipo_pagamento"]))
-        if not _cell_value("data_com"):
-            stable_fill.append(("data_com", row_norm["data_com"]))
-        if not _cell_value("status"):
-            stable_fill.append(("status", row_norm["status"]))
-        if not _cell_value("capturado_em"):
-            stable_fill.append(("capturado_em", row_norm["capturado_em"]))
-        if not _cell_value("fonte_url") and row_norm["fonte_url"]:
-            stable_fill.append(("fonte_url", row_norm["fonte_url"]))
-
-        # se a versão é igual e nada pra curar, pula
-        if prev_vhash and prev_vhash == vhash and not stable_fill:
+        # se versão não mudou, não faz nada
+        if prev_vhash and prev_vhash == vhash:
             continue
 
-        updates: List[Tuple[str, Any]] = []
-        updates.extend(stable_fill)
-
-        # campos que podem mudar (sempre atualiza quando vhash mudou)
-        if not (prev_vhash and prev_vhash == vhash):
-            updates.extend(
-                [
-                    ("status", row_norm["status"]),
-                    ("data_pagamento", row_norm["data_pagamento"]),
-                    ("valor_por_cota", "" if valor is None else valor),
-                    ("quantidade_ref", row_norm["quantidade_ref"]),
-                    ("fonte_url", row_norm["fonte_url"]),
-                    ("atualizado_em", row_norm["atualizado_em"]),
-                    ("version_hash", vhash),
-                ]
-            )
+        updates: List[Tuple[str, Any]] = [
+            ("status", row_norm["status"]),
+            ("data_pagamento", row_norm["data_pagamento"]),
+            ("valor_por_cota", "" if valor is None else valor),
+            ("quantidade_ref", row_norm["quantidade_ref"]),
+            ("fonte_url", row_norm["fonte_url"]),
+            ("atualizado_em", row_norm["atualizado_em"]),
+            ("version_hash", vhash),
+        ]
 
         for col, val in updates:
             cidx = hmap.get(col.lower())
             if not cidx:
                 continue
-            try:
-                ws_anun.update(_cell_a1(cidx, sheet_row), [[val]])
-            except Exception:
-                pass
+            cell_updates.append({
+                "range": _cell_a1(cidx, sheet_row),
+                "values": [[val]],
+            })
 
         existing_version_hash[eid] = vhash
         updated += 1
@@ -582,6 +541,7 @@ def run() -> None:
                 f"Valor/cota: {valor_txt}"
             )
             telegram_sent += 1
+ telegram_sent += 1
 
     if append_rows:
         ws_anun.append_rows(append_rows, value_input_option="USER_ENTERED")
