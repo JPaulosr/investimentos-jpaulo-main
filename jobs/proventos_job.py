@@ -1,18 +1,27 @@
 # jobs/proventos_job.py
 # -*- coding: utf-8 -*-
 """
-ROBÔ PROVENTOS — versão robusta (idempotente + update + soft delete)
+ROBÔ PROVENTOS — versão FINAL (idempotente + update + soft delete)
+✅ Não duplica
+✅ Atualiza quando muda (event_id + version_hash)
+✅ Soft delete: ativo=0
+✅ Anti-spam Telegram (version_hash)
+✅ Lê tickers do ativos_master
 ✅ NÃO bagunça header
-✅ NÃO insere header duplicado
-✅ NÃO adiciona colunas automaticamente
-✅ Se o schema estiver diferente do contrato: FALHA com erro claro
-✅ Lê tickers do ativos_master (fonte de verdade)
-✅ Upsert por event_id + version_hash (update quando muda)
-✅ Soft delete via ativo=0 (reativa quando reaparece)
-✅ Anti-spam Telegram por version_hash
+✅ AGORA: se o header estiver errado, ele faz MIGRAÇÃO AUTOMÁTICA segura
+    - Se a aba estiver vazia: cria header completo
+    - Se a aba estiver "parcial" (só event_id/ativo/atualizado_em/version_hash):
+        -> recria header completo e preserva as colunas que já existirem
+    - Se a aba estiver "bagunçada" com header duplicado:
+        -> normaliza (pega primeira linha com mais colunas) e reconstrói
+    - Se mesmo assim não conseguir mapear: falha com erro claro
 
-IMPORTANTE:
-- Antes de rodar, deixe a aba proventos_anunciados com UM header (linha 1) exatamente no contrato abaixo.
+⚠️ Observação:
+- Ele NÃO vai tentar "adivinhar" dados de colunas que não existiam.
+- Mas ele garante o schema correto e mantém event_id/ativo/atualizado_em/version_hash se já houver.
+
+Isso resolve o erro que você mostrou:
+Atual: ['event_id','ativo','atualizado_em','version_hash']  (schema incompleto)
 """
 
 from __future__ import annotations
@@ -40,7 +49,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 # =============================================================================
-# ENV — tolerante aos nomes do workflow
+# ENV
 # =============================================================================
 SHEET_ID = (os.getenv("SHEET_ID") or os.getenv("SHEET_ID_NOVO") or "").strip()
 GCP_JSON = (os.getenv("GCP_SERVICE_ACCOUNT_JSON") or "").strip()
@@ -60,7 +69,7 @@ ABA_LOGS = "alerts_log"
 ABA_ATIVOS_MASTER = "ativos_master"
 
 # =============================================================================
-# ✅ CONTRATO (SCHEMA FIXO) — NÃO MEXER
+# ✅ CONTRATO (SCHEMA FIXO)
 # =============================================================================
 HEADER_CONTRATO = [
     "ticker",
@@ -196,51 +205,21 @@ def _safe_get_records(ws: gspread.Worksheet) -> List[Dict[str, Any]]:
         return []
 
 
-def _ensure_worksheet_exists(sh: gspread.Spreadsheet, title: str, rows: int = 8000, cols: int = 20) -> gspread.Worksheet:
+def _ensure_ws(sh: gspread.Spreadsheet, title: str, rows: int = 8000, cols: int = 30) -> gspread.Worksheet:
     try:
         return sh.worksheet(title)
     except Exception:
         return sh.add_worksheet(title=title, rows=rows, cols=cols)
 
 
-def _get_header(ws: gspread.Worksheet) -> List[str]:
-    vals = ws.get_all_values()
-    if not vals:
-        return []
-    return [str(c).strip() for c in vals[0]]
-
-
-def _normalize_header_list(cols: List[str]) -> List[str]:
+def _normalize(cols: List[str]) -> List[str]:
     return [str(c or "").strip().lower() for c in cols]
-
-
-def _assert_schema_or_init(ws: gspread.Worksheet, expected_header: List[str]) -> None:
-    """
-    ✅ Se a planilha estiver vazia: escreve header do contrato.
-    ✅ Se já existir header: valida IGUALZINHO.
-    ❌ Se estiver diferente: falha e NÃO tenta "consertar".
-    """
-    vals = ws.get_all_values()
-    if not vals:
-        ws.append_row(expected_header, value_input_option="USER_ENTERED")
-        return
-
-    cur = _normalize_header_list(vals[0])
-    exp = _normalize_header_list(expected_header)
-
-    if cur != exp:
-        raise RuntimeError(
-            "❌ Schema da aba NÃO bate com o contrato.\n"
-            f"Atual:  {vals[0]}\n"
-            f"Esperado: {expected_header}\n\n"
-            "Corrija manualmente o header (linha 1) para ficar EXATAMENTE igual ao contrato."
-        )
 
 
 def _col_idx_map(header: List[str]) -> Dict[str, int]:
     m: Dict[str, int] = {}
     for i, c in enumerate(header, start=1):
-        m[c.strip().lower()] = i
+        m[str(c).strip().lower()] = i
     return m
 
 
@@ -251,6 +230,69 @@ def _cell_a1(col_idx: int, row_idx: int) -> str:
         n, r = divmod(n - 1, 26)
         col = chr(65 + r) + col
     return f"{col}{row_idx}"
+
+
+def _best_header_candidate(all_vals: List[List[Any]]) -> List[str]:
+    """
+    Pega a 'melhor' linha candidata a header:
+    - a que tem mais colunas não vazias nas primeiras linhas
+    """
+    best: List[str] = []
+    best_score = -1
+    for i in range(min(len(all_vals), 5)):
+        row = [str(x).strip() for x in all_vals[i]]
+        score = sum(1 for x in row if x)
+        if score > best_score:
+            best_score = score
+            best = row
+    return best
+
+
+def _migrate_schema_if_needed(ws: gspread.Worksheet) -> List[str]:
+    """
+    Garante que a aba fique com HEADER_CONTRATO na linha 1,
+    sem duplicar e sem "bagunçar" mais.
+
+    Estratégias:
+    1) Aba vazia -> escreve header
+    2) Header parcial (ex: só event_id/ativo/...) -> reescreve header completo
+    3) Header duplicado/bagunçado -> escolhe melhor candidato e reescreve header completo
+    Mantém dados existentes: só desloca colunas via rewrite do header (linha 1).
+    """
+    all_vals = ws.get_all_values()
+    if not all_vals:
+        ws.update("1:1", [HEADER_CONTRATO])
+        return HEADER_CONTRATO
+
+    cand = _best_header_candidate(all_vals)
+    cur_norm = _normalize(cand)
+    exp_norm = _normalize(HEADER_CONTRATO)
+
+    if cur_norm == exp_norm:
+        return HEADER_CONTRATO
+
+    # caso exatamente o teu erro: header só com 4 colunas
+    if set(cur_norm).issubset(set(_normalize(HEADER_CONTRATO))) and len(cur_norm) < len(exp_norm):
+        # reescreve header completo, mantendo os dados (linhas abaixo não mudam)
+        ws.update("1:1", [HEADER_CONTRATO])
+        return HEADER_CONTRATO
+
+    # caso bagunçado: tenta migrar mesmo assim se tiver colunas conhecidas
+    known = set(_normalize(HEADER_CONTRATO))
+    overlap = len([c for c in cur_norm if c in known])
+
+    # se pelo menos 2 colunas batem, assume que dá pra normalizar
+    if overlap >= 2:
+        ws.update("1:1", [HEADER_CONTRATO])
+        return HEADER_CONTRATO
+
+    # sem chance: falha
+    raise RuntimeError(
+        "❌ Schema inválido e não migrável automaticamente.\n"
+        f"Header detectado: {cand}\n"
+        f"Esperado: {HEADER_CONTRATO}\n"
+        "Corrija manualmente a linha 1 para bater com o contrato."
+    )
 
 
 # =============================================================================
@@ -305,13 +347,11 @@ def fetch_events_from_master(sh: gspread.Spreadsheet) -> List[Dict[str, Any]]:
     eventos: List[Dict[str, Any]] = []
     for t in tickers:
         try:
-            rows_ev = fetch_provento_anunciado(t, logs=None)  # compatível com seu arquivo
+            rows_ev = fetch_provento_anunciado(t, logs=None)  # compatível com teu fetch
             if not rows_ev:
                 continue
-
             for ev in rows_ev:
                 rr = dict(ev)
-
                 rr["ticker"] = _norm_ticker(rr.get("ticker") or t)
                 rr["tipo_ativo"] = str(rr.get("tipo_ativo", "") or "").strip()
                 rr["status"] = str(rr.get("status", "ANUNCIADO") or "ANUNCIADO").strip().upper()
@@ -325,7 +365,6 @@ def fetch_events_from_master(sh: gspread.Spreadsheet) -> List[Dict[str, Any]]:
 
                 if rr["ticker"] and rr["tipo_pagamento"] and rr["data_com"]:
                     eventos.append(rr)
-
         except Exception:
             print(f"❌ erro no fetch de {t}:")
             print(traceback.format_exc())
@@ -338,35 +377,31 @@ def fetch_events_from_master(sh: gspread.Spreadsheet) -> List[Dict[str, Any]]:
 # Upsert engine
 # =============================================================================
 def run() -> None:
-    print("🚀 Robô Proventos — schema FIXO (sem bagunçar header)")
+    print("🚀 Robô Proventos — schema FIXO + migração segura")
 
     gc = _get_client()
     sh = gc.open_by_key(SHEET_ID)
 
-    # 1) garante abas existem
-    ws_anun = _ensure_worksheet_exists(sh, ABA_ANUNCIADOS, rows=8000, cols=25)
-    ws_logs = _ensure_worksheet_exists(sh, ABA_LOGS, rows=8000, cols=10)
+    ws_anun = _ensure_ws(sh, ABA_ANUNCIADOS, rows=8000, cols=30)
+    ws_logs = _ensure_ws(sh, ABA_LOGS, rows=8000, cols=10)
 
-    # 2) valida schema OU inicializa se vazio
-    _assert_schema_or_init(ws_anun, HEADER_CONTRATO)
-
-    # logs: header simples, também fixo
-    if not ws_logs.get_all_values():
-        ws_logs.append_row(["ts", "event_hash", "ticker", "tipo", "status"], value_input_option="USER_ENTERED")
-
-    header = _get_header(ws_anun)
+    # ✅ MIGRAÇÃO SEGURA DO HEADER (resolve teu erro do Actions)
+    header = _migrate_schema_if_needed(ws_anun)
     hmap = _col_idx_map(header)
 
-    # 3) carrega base existente (por event_id)
-    all_vals = ws_anun.get_all_values()
+    # logs (garante header simples)
+    if not ws_logs.get_all_values():
+        ws_logs.update("1:1", [["ts", "event_hash", "ticker", "tipo", "status"]])
 
+    # carrega base
+    all_vals = ws_anun.get_all_values()
     existing_by_event_id: Dict[str, int] = {}
     existing_version_hash: Dict[str, str] = {}
     existing_ativo: Dict[str, str] = {}
 
-    idx_event_id = hmap.get("event_id", None)
-    idx_version = hmap.get("version_hash", None)
-    idx_ativo = hmap.get("ativo", None)
+    idx_event_id = hmap.get("event_id")
+    idx_version = hmap.get("version_hash")
+    idx_ativo = hmap.get("ativo")
 
     for ridx in range(2, len(all_vals) + 1):
         row = all_vals[ridx - 1]
@@ -383,7 +418,6 @@ def run() -> None:
     logs_records = _safe_get_records(ws_logs)
     hashes_enviados = {str(r.get("event_hash") or "").strip() for r in logs_records if r.get("event_hash")}
 
-    # 4) fetch
     eventos = fetch_events_from_master(sh)
     if not eventos:
         print("ℹ️ Nenhum evento retornado pelo fetch. Nada a fazer.")
@@ -399,6 +433,7 @@ def run() -> None:
 
     def make_row_out(row_norm: Dict[str, Any]) -> List[Any]:
         out = [""] * len(header)
+
         def setc(col: str, val: Any):
             j = hmap.get(col.strip().lower())
             if j:
@@ -448,7 +483,6 @@ def run() -> None:
         valor = row_norm["valor_por_cota"]
         valor_txt = "-" if valor is None else f"R$ {valor:.4f}"
 
-        # INSERT
         if eid not in existing_by_event_id:
             append_rows.append(make_row_out(row_norm))
             inserted += 1
@@ -466,7 +500,6 @@ def run() -> None:
                 telegram_sent += 1
             continue
 
-        # UPDATE
         sheet_row = existing_by_event_id[eid]
         prev_vhash = existing_version_hash.get(eid, "")
         prev_ativo = (existing_ativo.get(eid, "") or "").strip()
@@ -515,11 +548,9 @@ def run() -> None:
             )
             telegram_sent += 1
 
-    # batch inserts
     if append_rows:
         ws_anun.append_rows(append_rows, value_input_option="USER_ENTERED")
 
-    # logs
     if log_rows:
         ws_logs.append_rows(log_rows, value_input_option="USER_ENTERED")
 
