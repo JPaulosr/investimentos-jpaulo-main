@@ -541,7 +541,7 @@ def run() -> None:
                 f"Valor/cota: {valor_txt}"
             )
             telegram_sent += 1
- telegram_sent += 1
+ 
 
     if append_rows:
         ws_anun.append_rows(append_rows, value_input_option="USER_ENTERED")
