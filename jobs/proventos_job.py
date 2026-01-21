@@ -376,7 +376,7 @@ def fetch_events_from_master(sh: gspread.Spreadsheet) -> List[Dict[str, Any]]:
 # Engine
 # =============================================================================
 def run() -> None:
-    print("🚀 Robô Proventos — schema fixo + auto-fix")
+    print("🚀 Robô Proventos — schema fixo + auto-fix + batch write")
 
     gc = _get_client()
     sh = gc.open_by_key(SHEET_ID)
@@ -391,12 +391,13 @@ def run() -> None:
     # 2) corrige base “desalinhada” (teu print)
     _fix_misaligned_legacy_rows(ws_anun)
 
-    # logs header simples
+    # 3) garante header do logs
     if not ws_logs.get_all_values():
         ws_logs.update("1:1", [["ts", "event_hash", "ticker", "tipo", "status"]])
 
-    # 3) lê valores já com layout correto
+    # 4) carrega base anunciados
     all_vals = ws_anun.get_all_values()
+
     # ================================
     # MAPEAR ESTADO ATUAL DA PLANILHA
     # ================================
@@ -419,27 +420,67 @@ def run() -> None:
             continue
 
         existing_by_event_id[eid] = ridx
+        existing_version_hash[eid] = str(row[idx_version - 1]).strip() if idx_version - 1 < len(row) else ""
+        existing_ativo[eid] = str(row[idx_ativo - 1]).strip() if idx_ativo - 1 < len(row) else ""
 
-        if idx_version - 1 < len(row):
-            existing_version_hash[eid] = str(row[idx_version - 1]).strip()
-        else:
-            existing_version_hash[eid] = ""
+    # ================================
+    # ANTI-SPAM (hashes já enviados)
+    # ================================
+    logs_records = _safe_get_records(ws_logs)
+    hashes_enviados = {str(r.get("event_hash") or "").strip() for r in logs_records if r.get("event_hash")}
+    print(f"🧱 Anti-spam: {len(hashes_enviados)} hashes no alerts_log")
 
-        if idx_ativo - 1 < len(row):
-            existing_ativo[eid] = str(row[idx_ativo - 1]).strip()
-        else:
-            existing_ativo[eid] = ""
+    # ================================
+    # FETCH REAL
+    # ================================
+    eventos = fetch_events_from_master(sh)
+    if not eventos:
+        print("ℹ️ Nenhum evento retornado pelo fetch. Nada a fazer.")
+        return
 
+    # ================================
+    # CONTADORES + BUFFERS
+    # ================================
+    inserted = 0
+    updated = 0
+    reactivated = 0
+    telegram_sent = 0
 
-    # ==================================================
-    # ✅ ACUMULADOR DE UPDATES (BATCH WRITE)
-    # ==================================================
+    append_rows: List[List[Any]] = []
+    log_rows: List[List[Any]] = []
     cell_updates: List[Dict[str, Any]] = []
 
+    # ================================
+    # HELPER: montar linha no layout do header
+    # ================================
+    def make_row_out(row_norm: Dict[str, Any]) -> List[Any]:
+        out = [""] * len(header)
 
-    # ==================================================
+        def setc(col: str, val: Any):
+            j = hmap.get(col.strip().lower())
+            if j:
+                out[j - 1] = "" if val is None else val
+
+        setc("ticker", row_norm.get("ticker"))
+        setc("tipo_ativo", row_norm.get("tipo_ativo"))
+        setc("status", row_norm.get("status"))
+        setc("tipo_pagamento", row_norm.get("tipo_pagamento"))
+        setc("data_com", row_norm.get("data_com"))
+        setc("data_pagamento", row_norm.get("data_pagamento"))
+        setc("valor_por_cota", row_norm.get("valor_por_cota"))
+        setc("quantidade_ref", row_norm.get("quantidade_ref"))
+        setc("fonte_url", row_norm.get("fonte_url"))
+        setc("capturado_em", row_norm.get("capturado_em"))
+
+        setc("event_id", row_norm.get("event_id"))
+        setc("ativo", row_norm.get("ativo"))
+        setc("atualizado_em", row_norm.get("atualizado_em"))
+        setc("version_hash", row_norm.get("version_hash"))
+        return out
+
+    # ================================
     # LOOP PRINCIPAL DE EVENTOS
-    # ==================================================
+    # ================================
     for ev in eventos:
         row_norm: Dict[str, Any] = {
             "ticker": _norm_ticker(ev.get("ticker", "")),
@@ -469,9 +510,9 @@ def run() -> None:
         valor = row_norm["valor_por_cota"]
         valor_txt = "-" if valor is None else f"R$ {valor:.4f}"
 
-        # ==================================================
+        # ----------------
         # INSERT
-        # ==================================================
+        # ----------------
         if eid not in existing_by_event_id:
             append_rows.append(make_row_out(row_norm))
             inserted += 1
@@ -489,23 +530,22 @@ def run() -> None:
                 telegram_sent += 1
             continue
 
-        # ==================================================
-        # UPDATE (BATCH — NÃO ESCREVE AQUI)
-        # ==================================================
+        # ----------------
+        # UPDATE (BATCH)
+        # ----------------
         sheet_row = existing_by_event_id[eid]
         prev_vhash = existing_version_hash.get(eid, "")
-        prev_ativo = existing_ativo.get(eid, "").strip()
+        prev_ativo = (existing_ativo.get(eid, "") or "").strip()
 
         # reativar soft delete
         if prev_ativo in ("0", "False", "false", ""):
-            cell_updates.append({
-                "range": _cell_a1(hmap["ativo"], sheet_row),
-                "values": [[1]],
-            })
+            cell_updates.append(
+                {"range": _cell_a1(hmap["ativo"], sheet_row), "values": [[1]]}
+            )
             existing_ativo[eid] = "1"
             reactivated += 1
 
-        # se versão não mudou, não faz nada
+        # se versão não mudou, não atualiza
         if prev_vhash and prev_vhash == vhash:
             continue
 
@@ -523,10 +563,7 @@ def run() -> None:
             cidx = hmap.get(col.lower())
             if not cidx:
                 continue
-            cell_updates.append({
-                "range": _cell_a1(cidx, sheet_row),
-                "values": [[val]],
-            })
+            cell_updates.append({"range": _cell_a1(cidx, sheet_row), "values": [[val]]})
 
         existing_version_hash[eid] = vhash
         updated += 1
@@ -541,19 +578,32 @@ def run() -> None:
                 f"Valor/cota: {valor_txt}"
             )
             telegram_sent += 1
- 
 
+    # ================================
+    # GRAVAÇÕES (ANTI-429)
+    # ================================
+    # INSERTS em chunks
     if append_rows:
-        ws_anun.append_rows(append_rows, value_input_option="USER_ENTERED")
+        CHUNK = 20
+        for i in range(0, len(append_rows), CHUNK):
+            ws_anun.append_rows(append_rows[i:i + CHUNK], value_input_option="USER_ENTERED")
 
+    # UPDATES em batch (1 request)
+    if cell_updates:
+        ws_anun.batch_update(cell_updates)
+
+    # LOGS em chunks
     if log_rows:
-        ws_logs.append_rows(log_rows, value_input_option="USER_ENTERED")
+        CHUNK = 50
+        for i in range(0, len(log_rows), CHUNK):
+            ws_logs.append_rows(log_rows[i:i + CHUNK], value_input_option="USER_ENTERED")
 
     print(f"✅ Inseridos: {inserted}")
     print(f"🔁 Atualizados: {updated}")
     print(f"♻️ Reativados: {reactivated}")
     print(f"📨 Telegram enviados: {telegram_sent}")
     print("🏁 Concluído.")
+
 
 if __name__ == "__main__":
     run()
