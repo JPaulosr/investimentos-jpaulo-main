@@ -117,6 +117,13 @@ def _gsheets_client():
         raise RuntimeError("Faltou o secret GCP_SERVICE_ACCOUNT_JSON no GitHub.")
 
     info = json.loads(sa_json)
+    
+    # --- CORREÇÃO DE ERRO DE PEM / NEWLINE ---
+    # Corrige a chave privada caso o GitHub tenha escapado as quebras de linha (\n virou \\n)
+    if "private_key" in info:
+        info["private_key"] = info["private_key"].replace("\\n", "\n")
+    # -----------------------------------------
+
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
