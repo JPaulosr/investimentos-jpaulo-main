@@ -17,7 +17,7 @@ from google.oauth2.service_account import Credentials
 
 
 # =============================================================================
-# Secrets (Somente Banco de Dados do APP)
+# Secrets
 # =============================================================================
 def _get_secret(*keys: str, default=None):
     for k in keys:
@@ -30,7 +30,6 @@ def _get_secret(*keys: str, default=None):
     return default
 
 
-# APP DB (Planilha NOVA)
 SHEET_ID = _get_secret("SHEET_ID_NOVO", "SHEET_ID")
 ABA_ATIVOS = _get_secret("ABA_ATIVOS_NOVO", "ABA_ATIVOS", default="ativos_master")
 ABA_LANCAMENTOS = _get_secret("ABA_MOVIMENTACOES_NOVO", "ABA_LANCAMENTOS", default="movimentacoes")
@@ -225,7 +224,7 @@ _HEADER_ALIASES: Dict[str, List[str]] = {
 
 
 # =============================================================================
-# Escrita robusta (sem insert_row) + anti "grid limits"
+# Escrita robusta
 # =============================================================================
 def _col_letter_from_index(idx_1based: int) -> str:
     if idx_1based < 1:
@@ -235,10 +234,6 @@ def _col_letter_from_index(idx_1based: int) -> str:
 
 
 def _ensure_rows(ws, target_row: int, extra: int = 50):
-    """
-    Garante que o worksheet tenha pelo menos target_row linhas.
-    Evita erro: Range exceeds grid limits.
-    """
     try:
         target_row = int(target_row or 1)
         extra = int(extra or 0)
@@ -249,12 +244,10 @@ def _ensure_rows(ws, target_row: int, extra: int = 50):
             new_rows = target_row + max(0, extra)
             _execute_with_retry(ws.resize, rows=new_rows)
     except Exception:
-        # deixa estourar no update caso a API recuse resize
         pass
 
 
 def _find_next_row_anchor(ws, anchor_col_letter: str, max_scan: int = 8000) -> int:
-    """Acha próxima linha livre olhando apenas a coluna âncora (rápido)."""
     anchor_col_letter = (anchor_col_letter or "A").strip().upper()
     rng = f"{anchor_col_letter}2:{anchor_col_letter}{max_scan}"
     col_vals = _execute_with_retry(ws.get, rng) or []
@@ -269,7 +262,6 @@ def _find_next_row_anchor(ws, anchor_col_letter: str, max_scan: int = 8000) -> i
 
 
 def _find_next_row_anchor_from(ws, anchor_col_letter: str, start_row: int = 2, max_scan: int = 8000) -> int:
-    """Acha próxima linha livre olhando a coluna âncora, começando em start_row."""
     anchor_col_letter = (anchor_col_letter or "A").strip().upper()
     start_row = max(2, int(start_row or 2))
     rng = f"{anchor_col_letter}{start_row}:{anchor_col_letter}{max_scan}"
@@ -293,10 +285,6 @@ def _is_anchor_filled(ws, anchor_col_letter: str, row_index: int) -> bool:
 
 
 def _sparse_update_cells(ws, row_index: int, updates: Dict[int, Any]) -> None:
-    """
-    Atualiza só colunas necessárias, na mesma linha.
-    Antes garante linhas suficientes (anti grid limit).
-    """
     _ensure_rows(ws, row_index, extra=50)
     for col_idx, v in updates.items():
         if v is None:
@@ -402,9 +390,19 @@ def load_proventos_anunciados() -> pd.DataFrame:
 
 
 # =============================================================================
-# PROVENTOS ANUNCIADOS
+# ALIAS PARA COMPATIBILIDADE (FIX: O ERRO ESTAVA AQUI)
 # =============================================================================
-PROVENTOS_ANUNCIADOS_HEADERS = [
+def load_anuncios():
+    """Alias para carregar proventos anunciados."""
+    return load_proventos_anunciados()
+
+
+# =============================================================================
+# PROVENTOS ANUNCIADOS — CONTRATO ÚNICO (14 colunas) + UPSERT IDEMPOTENTE
+# =============================================================================
+# Regra: esta aba é fonte única para "anunciados" e deve ser compatível com jobs/proventos_job.py
+# Colunas (ordem fixa):
+PROVENTOS_ANUNCIADOS_HEADER_CONTRATO = [
     "ticker",
     "tipo_ativo",
     "status",
@@ -415,264 +413,320 @@ PROVENTOS_ANUNCIADOS_HEADERS = [
     "quantidade_ref",
     "fonte_url",
     "capturado_em",
-    "fonte_nome",
+    "event_id",
+    "ativo",
+    "atualizado_em",
+    "version_hash",
 ]
 
+_HEX40 = re.compile(r"^[a-f0-9]{40}$", re.I)
+
+def _pa_norm_ticker(v: Any) -> str:
+    if not v:
+        return ""
+    s = str(v).strip().upper()
+    return re.sub(r"[^A-Z0-9]", "", s)
+
+def _pa_norm_date(v: Any) -> str:
+    if not v:
+        return ""
+    if hasattr(v, "strftime"):
+        try:
+            return v.strftime("%Y-%m-%d")
+        except Exception:
+            return ""
+    s = str(v).strip()
+    if not s:
+        return ""
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except Exception:
+            continue
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "").split(".")[0])
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return ""
+
+def _pa_norm_float(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip()
+    if not s:
+        return None
+    s = re.sub(r"[^0-9,.\-]", "", s)
+    if "," in s and "." in s:
+        s = s.replace(".", "").replace(",", ".")
+    else:
+        s = s.replace(",", ".")
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+def _pa_sha1(text: str) -> str:
+    import hashlib
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+def _pa_event_id(ticker: str, tipo_pagamento: str, data_com: str, data_pagamento: str) -> str:
+    key = "|".join([_pa_norm_ticker(ticker), (tipo_pagamento or "").strip().upper(), _pa_norm_date(data_com), _pa_norm_date(data_pagamento)])
+    return _pa_sha1(key)
+
+def _pa_version_hash(event_id: str, valor_por_cota: Any, status: str) -> str:
+    v = _pa_norm_float(valor_por_cota)
+    vtxt = "" if v is None else f"{float(v):.8f}"
+    key = "|".join([event_id, vtxt, (status or "").strip().upper()])
+    return _pa_sha1(key)
+
+def _pa_normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    r = dict(row or {})
+    r["ticker"] = _pa_norm_ticker(r.get("ticker", ""))
+    r["tipo_ativo"] = str(r.get("tipo_ativo", "") or "").strip()
+    r["status"] = str(r.get("status", "ANUNCIADO") or "ANUNCIADO").strip().upper()
+    r["tipo_pagamento"] = str(r.get("tipo_pagamento", "") or "").strip().upper()
+    r["data_com"] = _pa_norm_date(r.get("data_com", ""))
+    r["data_pagamento"] = _pa_norm_date(r.get("data_pagamento", ""))
+    r["valor_por_cota"] = _pa_norm_float(r.get("valor_por_cota", None))
+    r["quantidade_ref"] = r.get("quantidade_ref", "")
+    r["fonte_url"] = str(r.get("fonte_url", "") or "").strip()
+    r["capturado_em"] = str(r.get("capturado_em", "") or _now_iso_min())
+    return r
+
+def _pa_col_letter(col_idx_1based: int) -> str:
+    s = ""
+    n = col_idx_1based
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+def _pa_a1(col_idx_1based: int, row_idx_1based: int) -> str:
+    return f"{_pa_col_letter(col_idx_1based)}{row_idx_1based}"
+
+def _pa_hmap(header: List[str]) -> Dict[str, int]:
+    return {str(c).strip().lower(): i for i, c in enumerate(header, start=1)}
 
 def ensure_proventos_anunciados_tab() -> bool:
-    gc = _gc()
+    """Garante aba + header no contrato (14 colunas). Não insere linha; reescreve a linha 1."""
     try:
+        gc = _gc()
         sh = _execute_with_retry(gc.open_by_key, SHEET_ID)
         tab = (ABA_PROVENTOS_ANUNCIADOS or "proventos_anunciados").strip()
+
         try:
             ws = sh.worksheet(tab)
         except Exception:
-            ws = sh.add_worksheet(title=tab, rows=2000, cols=15)
-        current = _execute_with_retry(ws.get_values, "A1:K1") or [[]]
-        if len([x for x in current[0] if x]) < 3:
-            _execute_with_retry(
-                ws.update,
-                "A1",
-                [PROVENTOS_ANUNCIADOS_HEADERS],
-                value_input_option="USER_ENTERED",
-            )
-        return True
-    except Exception:
-        return False
+            ws = sh.add_worksheet(title=tab, rows=8000, cols=30)
 
-
-def _prov_anun_key(row: Dict) -> str:
-    t = str((row or {}).get("ticker", "")).strip().upper()
-    tp = str((row or {}).get("tipo_pagamento", "")).strip().upper()
-    dc = str((row or {}).get("data_com", "")).strip()
-    dp = str((row or {}).get("data_pagamento", "")).strip()
-    return f"{t}|{tp}|{dc}|{dp}"
-
-
-def _find_existing_row_index(ws, key: str) -> int:
-    try:
-        values = _execute_with_retry(ws.get_all_values)
-        if not values or len(values) < 2:
-            return 0
-        header = [str(h).strip() for h in values[0]]
-        idx = {h.lower().strip(): i for i, h in enumerate(header)}
-        req = ["ticker", "tipo_pagamento", "data_com", "data_pagamento"]
-        if any(r not in idx for r in req):
-            return 0
-        for i, row in enumerate(values[1:], start=2):
-            r = {
-                "ticker": row[idx["ticker"]] if idx["ticker"] < len(row) else "",
-                "tipo_pagamento": row[idx["tipo_pagamento"]] if idx["tipo_pagamento"] < len(row) else "",
-                "data_com": row[idx["data_com"]] if idx["data_com"] < len(row) else "",
-                "data_pagamento": row[idx["data_pagamento"]] if idx["data_pagamento"] < len(row) else "",
-            }
-            if _prov_anun_key(r) == key:
-                return i
-        return 0
-    except Exception:
-        return 0
-
-
-def append_provento_anunciado(row: Dict) -> bool:
-    try:
-        if not ensure_proventos_anunciados_tab():
-            return False
-        tab = (ABA_PROVENTOS_ANUNCIADOS or "proventos_anunciados").strip()
-        ws = _open_ws(SHEET_ID, tab, show_error=False)
-        if not ws:
-            return False
-
-        r = dict(row or {})
-        r["ticker"] = str(r.get("ticker", "")).upper().strip()
-        if not r.get("capturado_em"):
-            r["capturado_em"] = _now_iso_min()
-
-        val_num = _to_float_safe(r.get("valor_por_cota"))
-        if val_num is None or val_num <= 0:
-            return False
-        r["valor_por_cota"] = _fmt_float_ptbr(val_num)
-
-        key = _prov_anun_key(r)
-        existing_idx = _find_existing_row_index(ws, key)
-        if existing_idx:
-            header = _execute_with_retry(ws.row_values, 1) or []
-            idx = {str(h).strip().lower(): i for i, h in enumerate(header)}
-            if "valor_por_cota" in idx:
-                col = idx["valor_por_cota"] + 1
-                _execute_with_retry(ws.update_cell, existing_idx, col, r["valor_por_cota"])
-                _clear_cached_reads()
-                return True
-            return False
-
-        ok = _append_row_by_header(ws, r, value_input_option="USER_ENTERED")
-        if ok:
-            _clear_cached_reads()
+        vals = _execute_with_retry(ws.get_all_values) or []
+        if not vals:
+            _execute_with_retry(ws.update, "1:1", [PROVENTOS_ANUNCIADOS_HEADER_CONTRATO], value_input_option="USER_ENTERED")
             return True
-        return False
+
+        cur = [str(x or "").strip().lower() for x in (vals[0] or [])]
+        exp = [str(x or "").strip().lower() for x in PROVENTOS_ANUNCIADOS_HEADER_CONTRATO]
+
+        # se header diferente, força (sem inserir linha)
+        if cur[: len(exp)] != exp:
+            _execute_with_retry(ws.update, "1:1", [PROVENTOS_ANUNCIADOS_HEADER_CONTRATO], value_input_option="USER_ENTERED")
+
+        return True
     except Exception:
         return False
 
-
-# =============================================================================
-# ESCRITA PRINCIPAL (BASE NOVA)
-# =============================================================================
-def append_provento(row: Dict) -> bool:
-    success = False
-    row = _ensure_id_and_created_at(row, default_tipo="PROVENTO")
-    row_clean = row.copy()
-
-    for col in ["valor", "quantidade_na_data", "valor_por_cota"]:
-        if col in row_clean:
-            val = _to_float_safe(row_clean[col])
-            row_clean[col] = _fmt_float_ptbr(val)
-
-    try:
-        tab = (ABA_PROVENTOS or "proventos").strip()
-        ws = _open_ws(SHEET_ID, tab, show_error=True)
-        if ws and _append_row_by_header(ws, row_clean):
-            success = True
-            st.toast("✅ Provento Salvo!", icon="💰")
-    except Exception as e:
-        st.error(f"❌ Erro ao salvar provento: {e}")
-
-    if success:
-        load_proventos.clear()
-    return success
-
-
-def append_movimentacao(row: Dict) -> bool:
-    success = False
-    row = _ensure_id_and_created_at(row, default_tipo="OPERACAO")
-    row_clean = row.copy()
-
-    for col in ["quantidade", "preco_unitario", "valor_total", "taxa"]:
-        if col in row_clean:
-            val = _to_float_safe(row_clean[col])
-            row_clean[col] = _fmt_float_ptbr(val)
-
-    try:
-        tab = (ABA_LANCAMENTOS or "movimentacoes").strip()
-        ws = _open_ws(SHEET_ID, tab, show_error=True)
-        if ws and _append_row_by_header(ws, row_clean):
-            success = True
-            st.toast("✅ Operação Salva!", icon="💾")
-    except Exception as e:
-        st.error(f"❌ Erro ao salvar operação: {e}")
-
-    if success:
-        load_movimentacoes.clear()
-    return success
-
-
-# =============================================================================
-# LEGADO — OPERAÇÕES (Espelho)
-# Colunas típicas: C ticker, D data, E tipo (Compra/Venda), I qtd, J preço
-# =============================================================================
-def get_ws_movs_legado():
-    sheet_id = st.secrets.get("SHEET_ID_PRINCIPAL")
-    aba = st.secrets.get("ABA_PRINCIPAL_MOVIMENTACOES")
-    if not sheet_id or not aba:
-        raise RuntimeError("Secrets ausentes: SHEET_ID_PRINCIPAL / ABA_PRINCIPAL_MOVIMENTACOES")
-    ws = _open_ws(sheet_id, aba, show_error=True)
-    if not ws:
-        raise RuntimeError("Não foi possível abrir worksheet legado (movimentacoes).")
-    return ws
-
-
-def append_movimentacao_legado(row: Dict, ws=None, state: Optional[Dict] = None) -> bool:
+def append_provento_anunciado_batch(rows: List[Dict[str, Any]]) -> int:
     """
-    Espelho para planilha antiga (movimentações).
-    Otimizado: se passar ws/state, evita scan a cada linha.
+    UPSERT idempotente:
+    - Dedup por event_id = sha1(ticker|tipo_pagamento|data_com|data_pagamento)
+    - Update se version_hash mudou
+    - Cura base: recalcula event_id com datas normalizadas e evita duplicação causada por IDs antigos
+    Retorna: quantidade de linhas inseridas + atualizadas
     """
-    try:
-        if ws is None:
-            ws = get_ws_movs_legado()
-        if state is None:
-            state = {}
+    if not rows:
+        return 0
 
-        # âncora: coluna C (ticker)
-        if not state.get("next_row"):
-            state["next_row"] = _find_next_row_anchor(ws, "C", max_scan=8000)
-        next_row = int(state["next_row"])
+    if not ensure_proventos_anunciados_tab():
+        return 0
 
-        tipo_in = str(row.get("tipo", "")).strip().upper()
-        tipo_legado = {"COMPRA": "Compra", "VENDA": "Venda"}.get(tipo_in, "Compra")
+    gc = _gc()
+    sh = _execute_with_retry(gc.open_by_key, SHEET_ID)
+    tab = (ABA_PROVENTOS_ANUNCIADOS or "proventos_anunciados").strip()
+    ws = sh.worksheet(tab)
 
-        updates = {
-            3: str(row.get("ticker", "")).upper().strip(),  # C
-            4: str(row.get("data", "")).strip(),            # D
-            5: tipo_legado,                                  # E
-            9: _fmt_float_ptbr(_to_float_safe(row.get("quantidade"))),       # I
-            10: _fmt_float_ptbr(_to_float_safe(row.get("preco_unitario"))),  # J
-        }
+    header = PROVENTOS_ANUNCIADOS_HEADER_CONTRATO
+    h = _pa_hmap(header)
 
-        _sparse_update_cells(ws, next_row, updates)
-        state["next_row"] = next_row + 1
-        return True
+    all_vals = _execute_with_retry(ws.get_all_values) or []
+    if not all_vals:
+        _execute_with_retry(ws.update, "1:1", [header], value_input_option="USER_ENTERED")
+        all_vals = [header]
 
-    except Exception as e:
-        st.error(f"Erro ao salvar na base antiga (movimentacoes): {e}")
-        return False
+    # mapa do que existe — baseado no ID RECALCULADO (não confia no ID da célula)
+    existing_row_by_eid: Dict[str, int] = {}
+    existing_vhash_by_eid: Dict[str, str] = {}
+    existing_eid_cell_by_row: Dict[int, str] = {}
 
+    # correções/curas em lote
+    cell_updates: List[Dict[str, Any]] = []
 
-# =============================================================================
-# LEGADO — PROVENTOS (Espelho)
-# B ticker | C tipo | D data | E quantidade | F unitário (NÃO escreve) | G total
-# =============================================================================
-def get_ws_proventos_legado():
-    sheet_id = st.secrets.get("SHEET_ID_PRINCIPAL")
-    aba = st.secrets.get("ABA_PRINCIPAL_PROVENTOS")  # ex: "3. Proventos"
-    if not sheet_id or not aba:
-        raise RuntimeError("Secrets ausentes: SHEET_ID_PRINCIPAL / ABA_PRINCIPAL_PROVENTOS")
-    ws = _open_ws(sheet_id, aba, show_error=True)
-    if not ws:
-        raise RuntimeError("Não foi possível abrir worksheet legado (proventos).")
-    return ws
+    idx_ticker = h["ticker"]
+    idx_tipo = h["tipo_pagamento"]
+    idx_dc = h["data_com"]
+    idx_dp = h["data_pagamento"]
+    idx_eid = h["event_id"]
+    idx_ativo = h["ativo"]
+    idx_upd = h["atualizado_em"]
+    idx_vh = h["version_hash"]
 
+    # varre linhas existentes e cura event_id/version_hash inconsistentes
+    for ridx in range(2, len(all_vals) + 1):
+        row = all_vals[ridx - 1] if ridx - 1 < len(all_vals) else []
+        if not row or all(str(x).strip() == "" for x in row):
+            continue
 
-def append_provento_legado(row: Dict, ws=None, state: Optional[Dict] = None) -> bool:
-    """
-    Planilha antiga (v4.5) — Aba: 3. Proventos
-    Preenche APENAS:
-      B ticker
-      C tipo provento
-      D data
-      E quantidade
-      G total líquido
-    NÃO preencher F (Unitário).
-    """
-    try:
-        if ws is None:
-            ws = get_ws_proventos_legado()
-        if state is None:
-            state = {}
+        ticker = row[idx_ticker - 1] if idx_ticker - 1 < len(row) else ""
+        tipo = row[idx_tipo - 1] if idx_tipo - 1 < len(row) else ""
+        dc = row[idx_dc - 1] if idx_dc - 1 < len(row) else ""
+        dp = row[idx_dp - 1] if idx_dp - 1 < len(row) else ""
+        eid_calc = _pa_event_id(ticker, tipo, dc, dp)
 
-        # ✅ começa depois do cabeçalho. Seus dados começam na linha 4.
-        if not state.get("next_row"):
-            state["next_row"] = _find_next_row_anchor_from(ws, "B", start_row=4, max_scan=8000)
-        next_row = int(state["next_row"])
+        eid_cell = row[idx_eid - 1] if idx_eid - 1 < len(row) else ""
+        eid_cell = str(eid_cell).strip()
 
-        tipo_in = str(row.get("tipo", "")).strip().upper()
-        tipo_legado = {
-            "RENDIMENTO": "Rendimento",
-            "DIVIDENDO": "Dividendo",
-            "JCP": "JCP",
-            "AMORTIZACAO": "Amortização",
-            "AMORTIZAÇÃO": "Amortização",
-        }.get(tipo_in, "Rendimento")
+        # guarda para possíveis merges
+        existing_eid_cell_by_row[ridx] = eid_cell
 
-        updates = {
-            2: str(row.get("ticker", "")).upper().strip(),                      # B
-            3: tipo_legado,                                                     # C
-            4: str(row.get("data", "")).strip(),                                # D
-            5: _fmt_float_ptbr(_to_float_safe(row.get("quantidade_na_data"))),  # E
-            7: _fmt_float_ptbr(_to_float_safe(row.get("valor"))),               # G
-        }
+        # se já tem outro com mesmo eid_calc, consolida mantendo o mais novo (atualizado_em/capturado_em)
+        if eid_calc in existing_row_by_eid:
+            keep_row = existing_row_by_eid[eid_calc]
+            # timestamps (ISO) — se faltar, cai para string vazia
+            def _ts_of(rindex: int) -> str:
+                r = all_vals[rindex - 1] if rindex - 1 < len(all_vals) else []
+                ts = ""
+                if idx_upd - 1 < len(r):
+                    ts = str(r[idx_upd - 1]).strip()
+                if not ts and h.get("capturado_em") and (h["capturado_em"] - 1) < len(r):
+                    ts = str(r[h["capturado_em"] - 1]).strip()
+                return ts
 
-        _sparse_update_cells(ws, next_row, updates)
-        state["next_row"] = next_row + 1
-        return True
+            ts_keep = _ts_of(keep_row)
+            ts_new = _ts_of(ridx)
 
-    except Exception as e:
-        st.error(f"Erro ao salvar provento na base antiga: {e}")
-        return False
+            # decide: mantém quem tiver timestamp maior (lexicográfico funciona em ISO YYYY-MM-DD HH:MM)
+            if ts_new > ts_keep:
+                drop_row, keep_row = keep_row, ridx
+                existing_row_by_eid[eid_calc] = keep_row
+            else:
+                drop_row = ridx
+
+            # soft delete do descartado
+            cell_updates.append({"range": _pa_a1(idx_ativo, drop_row), "values": [[0]]})
+            cell_updates.append({"range": _pa_a1(idx_upd, drop_row), "values": [[_now_iso_min()]]})
+            continue
+
+        existing_row_by_eid[eid_calc] = ridx
+        vh_cell = row[idx_vh - 1] if idx_vh - 1 < len(row) else ""
+        existing_vhash_by_eid[eid_calc] = str(vh_cell).strip()
+
+        # cura: se event_id da célula está vazio ou diferente do recalculado, atualiza
+        if (not eid_cell) or (eid_cell != eid_calc):
+            cell_updates.append({"range": _pa_a1(idx_eid, ridx), "values": [[eid_calc]]})
+
+    # prepara inserts/updates
+    append_rows: List[List[Any]] = []
+    inserted = 0
+    updated = 0
+
+    def _make_out(rn: Dict[str, Any], eid: str, vhash: str) -> List[Any]:
+        out = [""] * len(header)
+        out[h["ticker"] - 1] = rn.get("ticker", "")
+        out[h["tipo_ativo"] - 1] = rn.get("tipo_ativo", "")
+        out[h["status"] - 1] = rn.get("status", "")
+        out[h["tipo_pagamento"] - 1] = rn.get("tipo_pagamento", "")
+        out[h["data_com"] - 1] = rn.get("data_com", "")
+        out[h["data_pagamento"] - 1] = rn.get("data_pagamento", "")
+        out[h["valor_por_cota"] - 1] = "" if rn.get("valor_por_cota") is None else rn.get("valor_por_cota")
+        out[h["quantidade_ref"] - 1] = rn.get("quantidade_ref", "")
+        out[h["fonte_url"] - 1] = rn.get("fonte_url", "")
+        out[h["capturado_em"] - 1] = rn.get("capturado_em", "")
+        out[h["event_id"] - 1] = eid
+        out[h["ativo"] - 1] = 1
+        out[h["atualizado_em"] - 1] = _now_iso_min()
+        out[h["version_hash"] - 1] = vhash
+        return out
+
+    for row in rows:
+        rn = _pa_normalize_row(row)
+
+        # mínimos
+        if not rn["ticker"] or not rn["tipo_pagamento"] or not rn["data_com"]:
+            continue
+
+        eid = _pa_event_id(rn["ticker"], rn["tipo_pagamento"], rn["data_com"], rn["data_pagamento"])
+        vhash = _pa_version_hash(eid, rn.get("valor_por_cota"), rn.get("status"))
+
+        # INSERT
+        if eid not in existing_row_by_eid:
+            append_rows.append(_make_out(rn, eid, vhash))
+            existing_row_by_eid[eid] = -1
+            existing_vhash_by_eid[eid] = vhash
+            inserted += 1
+            continue
+
+        # UPDATE
+        sheet_row = existing_row_by_eid[eid]
+        prev_vh = existing_vhash_by_eid.get(eid, "")
+
+        # se era uma linha “soft deleted”, reativa
+        if sheet_row > 0:
+            # reativar
+            cell_updates.append({"range": _pa_a1(idx_ativo, sheet_row), "values": [[1]]})
+
+        # se não mudou, não atualiza
+        if prev_vh and prev_vh == vhash:
+            continue
+
+        if sheet_row > 0:
+            # atualiza campos principais + cura datas normalizadas na base
+            updates = [
+                ("ticker", rn["ticker"]),
+                ("tipo_ativo", rn["tipo_ativo"]),
+                ("status", rn["status"]),
+                ("tipo_pagamento", rn["tipo_pagamento"]),
+                ("data_com", rn["data_com"]),
+                ("data_pagamento", rn["data_pagamento"]),
+                ("valor_por_cota", "" if rn.get("valor_por_cota") is None else rn.get("valor_por_cota")),
+                ("quantidade_ref", rn.get("quantidade_ref", "")),
+                ("fonte_url", rn.get("fonte_url", "")),
+                ("capturado_em", rn.get("capturado_em", "")),
+                ("event_id", eid),
+                ("atualizado_em", _now_iso_min()),
+                ("version_hash", vhash),
+            ]
+            for col, val in updates:
+                cidx = h.get(col.lower())
+                if cidx:
+                    cell_updates.append({"range": _pa_a1(cidx, sheet_row), "values": [[val]]})
+
+            existing_vhash_by_eid[eid] = vhash
+            updated += 1
+
+    # grava inserts (chunks)
+    if append_rows:
+        CHUNK = 20
+        for i in range(0, len(append_rows), CHUNK):
+            _execute_with_retry(ws.append_rows, append_rows[i : i + CHUNK], value_input_option="USER_ENTERED")
+
+    # grava curas/updates (batch)
+    if cell_updates:
+        _execute_with_retry(ws.batch_update, cell_updates)
+
+    # limpa cache
+    _clear_cached_reads()
+    return int(inserted + updated)
+
+def append_provento_anunciado(row: Dict[str, Any]) -> bool:
+    return append_provento_anunciado_batch([row]) > 0
