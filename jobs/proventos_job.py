@@ -147,6 +147,7 @@ def event_id_from_row(row: Dict[str, Any]) -> str:
             _norm_ticker(row.get("ticker", "")),
             str(row.get("tipo_pagamento", "") or "").strip().upper(),
             _norm_date(row.get("data_com", "")),
+            _norm_date(row.get("data_pagamento", "")),  # ✅ entra no ID
         ]
     )
     return _sha1(key)
@@ -157,7 +158,6 @@ def event_version_fingerprint(row: Dict[str, Any]) -> str:
     key = "|".join(
         [
             event_id_from_row(row),
-            _norm_date(row.get("data_pagamento", "")),
             vtxt,
             str(row.get("status", "") or "").strip().upper(),
         ]
