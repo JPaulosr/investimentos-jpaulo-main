@@ -1,4 +1,4 @@
-📄 CONTRATO DO SISTEMA DE INVESTIMENTOS — v2.1
+📄 CONTRATO DO SISTEMA DE INVESTIMENTOS — v2.3
 
 (Atualização: Página “Momento do Aporte”)
 
@@ -537,3 +537,107 @@ C) Pagamentos Previstos no Dia
 - O sistema não faz recomendação de compra ou venda.
 - O sistema não executa aportes automaticamente.
 - Todo conteúdo enviado é informativo, auditável e rastreável.
+
+
+# =====================================================
+# ADENDO — PDFs, Proventos Anunciados e Blindagem (v2.2)
+# =====================================================
+
+## 12. Relatórios em PDF (Executivo e Auditoria)
+
+### 12.1 Objetivo
+Os relatórios em PDF têm finalidade **exclusivamente informativa e de auditoria humana**.
+Eles NÃO substituem a interface do aplicativo, NÃO executam lógica de decisão e NÃO alteram estado.
+
+### 12.2 Tipos de PDF
+
+**PDF Executivo**
+- Total recebido no mês (REAL)
+- Média móvel de 12 meses
+- Ranking do mês dentro da janela 12m
+- Top 5 ativos pagadores do mês
+- Pendentes anunciados do mês (informativo)
+- Distribuição por classe
+
+**PDF Auditoria**
+- Tabela completa de proventos do mês
+- Totais por tipo de provento
+- Datas, quantidades, VPC, origem
+- Pendentes detalhados (ANUNCIADOS)
+- Base para conferência contábil
+
+### 12.3 Regras Invioláveis
+- PDFs utilizam:
+  - proventos RECEBIDOS como renda real
+  - proventos ANUNCIADOS apenas como pendentes
+- PDFs NÃO:
+  - projetam renda futura automática
+  - fazem recomendação
+  - alteram dados
+- Pendentes NUNCA entram em totais de renda.
+
+### 12.4 Motor Único de PDF
+Toda geração e envio de PDF ocorre exclusivamente em:
+`utils/pdf_reports.py`
+
+É proibido:
+- gerar PDF em páginas Streamlit
+- usar `requests.post` direto para Telegram fora do util
+
+Páginas apenas chamam:
+`gerar_e_enviar_pdfs(...)`
+
+## 13. Proventos Anunciados
+
+### 13.1 Fonte da Verdade
+A aba `proventos_anunciados` é a única fonte para eventos futuros.
+
+### 13.2 Uso Permitido
+- PDFs: exibição como pendente informativo
+- Alertas: lembrete de eventos futuros
+
+### 13.3 Uso Proibido
+- Somar à renda
+- Afetar score
+- Gerar projeção automática
+
+## 14. Blindagem Técnica
+
+- Imports de PDF apenas no topo
+- Nenhuma página pode:
+  - duplicar lógica de PDF
+  - acessar Telegram diretamente para PDF
+- Qualquer exceção é violação de contrato
+
+## 15. Regra de Evolução
+
+Qualquer nova funcionalidade relacionada a:
+- PDF
+- Proventos futuros
+- Alertas
+
+DEVE primeiro atualizar este contrato.
+
+11.7 Enriquecimento Visual e Projeção Informativa nos Alertas
+
+Alertas de proventos anunciados podem incluir elementos visuais, como o logo do ativo, desde que:
+
+o logo seja obtido exclusivamente da aba ativos_master, por meio do campo logo_url;
+
+a ausência do logo não impeça nem invalide o envio do alerta.
+
+Alertas podem exibir projeção informativa de valor total, desde que:
+
+a projeção utilize exclusivamente a quantidade registrada na data-com do ativo;
+
+o valor seja apresentado explicitamente como projeção, nunca como renda garantida;
+
+proventos anunciados não entrem em somatórios, métricas, scores ou PDFs de renda.
+
+Para ações com JCP:
+
+o alerta deve distinguir claramente valor bruto por ação e valor líquido estimado, considerando a retenção padrão de 15% de IR;
+
+valores podem ser arredondados apenas para fins de comunicação, mantendo precisão total na base de dados.
+
+Esses alertas têm caráter estritamente informativo, são auditáveis, rastreáveis e não configuram recomendação de investimento.
