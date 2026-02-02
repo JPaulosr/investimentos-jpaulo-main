@@ -5,7 +5,6 @@ from __future__ import annotations
 
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
-import secrets
 import unicodedata
 import re
 import time
@@ -14,6 +13,7 @@ import pandas as pd
 import streamlit as st
 import gspread
 from google.oauth2.service_account import Credentials
+
 
 
 # =============================================================================
@@ -389,6 +389,210 @@ def load_proventos_anunciados() -> pd.DataFrame:
     return _read_ws_as_df(SHEET_ID, tab, show_error=False)
 
 
+
+# =============================================================================
+# WRITERS — compatibilidade com pages/04_Adicionar_Operacao.py (base nova + espelho legado)
+# =============================================================================
+# Observação:
+# - append_movimentacao / append_provento gravam na "base nova" (aba normalizada por header).
+# - *_legado gravam no "espelho legado" (layout fixo por colunas), sem quebrar quando não existir.
+# - get_ws_proventos_legado existe para compatibilidade (algumas páginas importam).
+
+# Sheet/abas legado (se não existir, cai para a mesma planilha nova e não quebra)
+SHEET_ID_LEGADO = _get_secret("SHEET_ID_LEGADO", "SHEET_ID_ANTIGO", "SHEET_ID_V4", "SHEET_ID_OLD", default=SHEET_ID)
+ABA_MOVIMENTACOES_LEGADO = _get_secret("ABA_MOVIMENTACOES_LEGADO", "ABA_LANCAMENTOS_LEGADO", default="2. Lançamentos (B3)")
+ABA_PROVENTOS_LEGADO = _get_secret("ABA_PROVENTOS_LEGADO", default="3. Proventos")
+
+
+def get_ws_movimentacoes(show_error: bool = True):
+    tab = (ABA_LANCAMENTOS or "movimentacoes").strip()
+    return _open_ws(SHEET_ID, tab, show_error=show_error)
+
+
+def get_ws_proventos(show_error: bool = True):
+    tab = (ABA_PROVENTOS or "proventos").strip()
+    return _open_ws(SHEET_ID, tab, show_error=show_error)
+
+
+def get_ws_movimentacoes_legado(show_error: bool = False):
+    tab = (ABA_MOVIMENTACOES_LEGADO or "movimentacoes").strip()
+    return _open_ws(SHEET_ID_LEGADO, tab, show_error=show_error)
+
+
+def get_ws_proventos_legado(show_error: bool = False):
+    tab = (ABA_PROVENTOS_LEGADO or "proventos").strip()
+    return _open_ws(SHEET_ID_LEGADO, tab, show_error=show_error)
+
+
+def append_movimentacao(row: Dict[str, Any]) -> bool:
+    """
+    Grava 1 movimentação na base nova (aba de movimentações).
+    Primeiro tenta por header (novo contrato).
+    Se falhar, usa fallback por coluna fixa (blindagem).
+    """
+    try:
+        ws = get_ws_movimentacoes(show_error=True)
+        if not ws:
+            return False
+
+        r = _ensure_id_and_created_at(
+            row,
+            default_tipo=str((row or {}).get("tipo", "OPERACAO"))
+        )
+
+        # 1️⃣ tentativa principal (por header)
+        ok = _append_row_by_header(ws, r)
+
+        # 2️⃣ fallback automático (se header não bater)
+        if not ok:
+            next_row = _find_next_row_anchor(ws, "A")
+            updates = {
+                1: r.get("id"),
+                2: r.get("data"),
+                3: r.get("ticker"),
+                4: r.get("tipo"),
+                5: r.get("quantidade"),
+                6: r.get("preco_unitario"),
+                7: r.get("taxa"),
+                8: r.get("valor_total"),
+            }
+            _sparse_update_cells(ws, next_row, updates)
+            ok = True
+
+        if ok:
+            _clear_cached_reads()
+
+        return bool(ok)
+
+    except Exception:
+        return False
+
+
+
+def append_provento(row: Dict[str, Any]) -> bool:
+    """
+    Grava 1 provento na base nova (aba de proventos), por header.
+    Espera chaves como: data, ticker, tipo, valor, quantidade_na_data, valor_por_cota...
+    """
+    try:
+        ws = get_ws_proventos(show_error=True)
+        if not ws:
+            return False
+
+        r = _ensure_id_and_created_at(row, default_tipo=str((row or {}).get("tipo", "PROVENTO")))
+        ok = _append_row_by_header(ws, r)
+        if ok:
+            _clear_cached_reads()
+        return bool(ok)
+    except Exception:
+        return False
+
+
+def append_movimentacao_legado(row: Dict[str, Any]) -> bool:
+    """
+    Espelho legado (layout fixo conforme Contrato Seção 9):
+    - C (3) ticker | D (4) data | E (5) tipo | I (9) quantidade | J (10) preco_unitario
+    """
+    try:
+        # Tenta abrir a planilha
+        ws = get_ws_movimentacoes_legado(show_error=False)
+        
+        # --- DIAGNÓSTICO DE ERRO ---
+        if not ws:
+            # Pega o nome que o sistema tentou buscar
+            nome_aba = (ABA_MOVIMENTACOES_LEGADO or "movimentacoes").strip()
+            # Mostra erro na tela para você ver
+            st.error(f"❌ ERRO LEGADO: Não encontrei a aba '{nome_aba}' na planilha. Verifique o nome no secrets.toml ou na planilha.")
+            return False
+        # ---------------------------
+
+        # Encontra próxima linha vazia baseada na coluna C (Ticker)
+        next_row = _find_next_row_anchor(ws, "C", max_scan=8000)
+        while _is_anchor_filled(ws, "C", next_row):
+            next_row += 1
+
+        # Tratamento do TIPO para o Dropdown do Legado
+        tipo_raw = str((row or {}).get("tipo", "")).strip().upper()
+        tipo_legado = "Compra" if tipo_raw == "COMPRA" else "Venda"
+        
+        if tipo_raw not in ["COMPRA", "VENDA"] and tipo_raw:
+             tipo_legado = tipo_raw.title()
+
+        updates = {
+            3: str((row or {}).get("ticker", "")).strip().upper(),  # Coluna C
+            4: str((row or {}).get("data", "")).strip(),            # Coluna D
+            5: tipo_legado,                                         # Coluna E
+            9: (row or {}).get("quantidade", 0),                    # Coluna I
+            10: (row or {}).get("preco_unitario", 0),               # Coluna J
+        }
+        
+        _sparse_update_cells(ws, next_row, updates)
+        
+        # Sucesso!
+        st.toast(f"✅ Gravado no Legado (Linha {next_row})", icon="💾") 
+        return True
+
+    except Exception as e:
+        st.error(f"❌ ERRO CRÍTICO LEGADO: {e}")
+        return False
+def _fmt_tipo_provento_legado(tipo: Any) -> str:
+    """Mantém a planilha v4.5 feliz (dropdown/cálculos)."""
+    s = str(tipo or "").strip()
+    up = s.upper()
+    if up in ("DIVIDENDO", "DIVIDENDOS"):
+        return "Dividendo"
+    if up in ("RENDIMENTO", "RENDIMENTOS"):
+        return "Rendimento"
+    if up in ("JCP", "J\u0301CP"):
+        return "JCP"
+    if up in ("AMORTIZACAO", "AMORTIZAÇÃO", "AMORTIZACAO", "AMORTIZA\u00c7\u00c3O"):
+        return "Amortização"
+    # fallback: capitaliza só a 1ª letra (evita tudo MAIÚSCULO)
+    return s[:1].upper() + s[1:].lower() if s else ""
+
+
+
+def append_provento_legado(row: Dict[str, Any], ws=None) -> bool:
+    """
+    Espelho legado (layout fixo - OTIMIZADO):
+    - B ticker | C tipo | D data | E quantidade | G total líquido
+    """
+    try:
+        if ws is None:
+            # Tenta abrir (sem mostrar erro para não travar fluxo visual)
+            ws = get_ws_proventos_legado(show_error=False)
+        
+        if not ws:
+            # Se não achou, avisa no console/log mas não trava
+            print("⚠️ Aviso: Aba de Proventos Legado não encontrada (3. Proventos).")
+            return False
+
+        # --- OTIMIZAÇÃO DE VELOCIDADE (TURBO) ---
+        # Baixa a coluna B inteira de uma vez (apenas 1 chamada de API)
+        col_b_values = _execute_with_retry(ws.col_values, 2) # 2 = Coluna B (Ticker)
+        
+        # A próxima linha vazia é o tamanho da lista + 1
+        next_row = len(col_b_values) + 1
+        
+        # Garante que não escrevemos no cabeçalho
+        if next_row < 2: 
+            next_row = 2
+
+        updates = {
+            2: str((row or {}).get("ticker", "")).strip().upper(),         # Coluna B
+            3: _fmt_tipo_provento_legado((row or {}).get("tipo", "")),      # Coluna C
+            4: str((row or {}).get("data", "")).strip(),                   # Coluna D
+            5: (row or {}).get("quantidade_na_data", (row or {}).get("quantidade", "")), # Coluna E
+            7: (row or {}).get("valor", ""),                               # Coluna G
+        }
+        
+        _sparse_update_cells(ws, next_row, updates)
+        return True
+
+    except Exception as e:
+        print(f"Erro ao gravar provento legado: {e}")
+        return False
+
 # =============================================================================
 # ALIAS PARA COMPATIBILIDADE (FIX: O ERRO ESTAVA AQUI)
 # =============================================================================
@@ -730,3 +934,341 @@ def append_provento_anunciado_batch(rows: List[Dict[str, Any]]) -> int:
 
 def append_provento_anunciado(row: Dict[str, Any]) -> bool:
     return append_provento_anunciado_batch([row]) > 0
+
+# --- COLE ISSO NO FINAL DO ARQUIVO utils/gsheets.py ---
+
+# =============================================================================
+# INBOX RI (Fatos Relevantes)
+# =============================================================================
+# Contrato da aba 'inbox_ri':
+# Colunas: data, ticker, titulo, link, status, resumo_ia
+
+ABA_INBOX_RI = "inbox_ri"
+
+def ensure_inbox_ri_tab() -> bool:
+    """Garante que a aba inbox_ri existe com o cabeçalho correto."""
+    try:
+        gc = _gc()
+        sh = _execute_with_retry(gc.open_by_key, SHEET_ID)
+        try:
+            ws = sh.worksheet(ABA_INBOX_RI)
+        except Exception:
+            ws = sh.add_worksheet(title=ABA_INBOX_RI, rows=1000, cols=10)
+            
+        header = ["data", "ticker", "titulo", "link", "status", "resumo_ia"]
+        
+        vals = _execute_with_retry(ws.get_all_values)
+        if not vals:
+            _execute_with_retry(ws.update, "1:1", [header], value_input_option="USER_ENTERED")
+        return True
+    except Exception as e:
+        print(f"Erro ao garantir inbox_ri: {e}")
+        return False
+
+def load_inbox_ri() -> pd.DataFrame:
+    """Lê a caixa de entrada de RI."""
+    ensure_inbox_ri_tab() # Garante que existe antes de ler
+    return _read_ws_as_df(SHEET_ID, ABA_INBOX_RI, show_error=False)
+
+def mark_ri_as_read(link: str, resumo: str):
+    """Marca um item como LIDO e salva o resumo."""
+    try:
+        ws = _open_ws(SHEET_ID, ABA_INBOX_RI, show_error=False)
+        if not ws: return False
+        
+        # Procura a linha pelo Link (coluna D = índice 4)
+        cell = _execute_with_retry(ws.find, link, in_column=4)
+        if cell:
+            # Atualiza Status (Col E/5) e Resumo (Col F/6)
+            row = cell.row
+            updates = [
+                {"range": f"E{row}", "values": [["LIDO"]]},
+                {"range": f"F{row}", "values": [[resumo]]}
+            ]
+            _execute_with_retry(ws.batch_update, updates)
+            _clear_cached_reads()
+            return True
+    except Exception as e:
+        print(f"Erro ao atualizar RI: {e}")
+        return False
+    
+# =============================================================================
+# INBOX RI (Fatos Relevantes) - COLE NO FINAL DO ARQUIVO gsheets.py
+# =============================================================================
+
+ABA_INBOX_RI = "inbox_ri"
+
+def ensure_inbox_ri_tab() -> bool:
+    """Garante que a aba inbox_ri existe na planilha."""
+    try:
+        gc = _gc()
+        sh = _execute_with_retry(gc.open_by_key, SHEET_ID)
+        
+        # Tenta pegar a aba, se não existir, cria
+        try:
+            ws = sh.worksheet(ABA_INBOX_RI)
+        except Exception:
+            ws = sh.add_worksheet(title=ABA_INBOX_RI, rows=1000, cols=10)
+            
+        # Garante o cabeçalho correto
+        header = ["data", "ticker", "titulo", "link", "status", "resumo_ia"]
+        vals = _execute_with_retry(ws.get_all_values)
+        
+        if not vals:
+            _execute_with_retry(ws.update, "1:1", [header], value_input_option="USER_ENTERED")
+            
+        return True
+    except Exception as e:
+        st.error(f"Erro na aba RI: {e}")
+        return False
+
+def load_inbox_ri() -> pd.DataFrame:
+    """Lê os dados da aba inbox_ri."""
+    ensure_inbox_ri_tab() # Cria se não existir
+    return _read_ws_as_df(SHEET_ID, ABA_INBOX_RI, show_error=False)
+
+def mark_ri_as_read(link: str, resumo: str):
+    """Marca um Fato Relevante como LIDO e salva o resumo da IA."""
+    try:
+        ws = _open_ws(SHEET_ID, ABA_INBOX_RI, show_error=False)
+        if not ws: return False
+        
+        # Procura a linha usando o Link (Coluna D = 4) como chave
+        cell = _execute_with_retry(ws.find, link, in_column=4)
+        if cell:
+            row = cell.row
+            # Atualiza Status (E) e Resumo (F)
+            updates = [
+                {"range": f"E{row}", "values": [["LIDO"]]},
+                {"range": f"F{row}", "values": [[resumo]]}
+            ]
+            _execute_with_retry(ws.batch_update, updates)
+            _clear_cached_reads() # Limpa cache para atualizar na hora
+            return True
+    except Exception as e:
+        print(f"Erro ao salvar RI: {e}")
+        return False
+# ... (Mantenha todo o código anterior do gsheets.py) ...
+
+# =============================================================================
+# MOMENTO DO APORTE (Abas e Loaders) - COLE NO FINAL DO ARQUIVO gsheets.py
+# =============================================================================
+
+ABA_WATCHLIST = _get_secret("ABA_WATCHLIST_APORTE", default="watchlist_aporte")
+ABA_REGRAS = _get_secret("ABA_REGRAS_APORTE", default="regras_aporte")
+ABA_ALERTAS = _get_secret("ABA_ALERTAS_ATIVOS", default="alertas_ativos")
+ABA_LIMITES = _get_secret("ABA_LIMITES_APORTE", default="limites_aporte")
+
+def ensure_aporte_tabs():
+    """Garante abas de aporte com headers."""
+    try:
+        gc = _gc()
+        sh = _execute_with_retry(gc.open_by_key, SHEET_ID)
+        
+        # Mapa: Nome da Aba -> Colunas
+        defs = {
+            ABA_WATCHLIST: ["ticker", "classe", "ativo"],
+            ABA_REGRAS: ["classe", "criterio", "peso", "ativo"],
+            ABA_ALERTAS: ["ticker", "classe", "severidade", "motivo", "ativo", "criado_em", "expira_em"],
+            ABA_LIMITES: ["classe", "peso_alvo", "min_pct", "max_pct"]
+        }
+
+        for tab_name, header in defs.items():
+            try:
+                ws = sh.worksheet(tab_name)
+            except:
+                ws = sh.add_worksheet(title=tab_name, rows=100, cols=10)
+            
+            vals = _execute_with_retry(ws.get_all_values)
+            if not vals:
+                _execute_with_retry(ws.update, "1:1", [header], value_input_option="USER_ENTERED")
+    except Exception as e:
+        print(f"Erro Aporte Tabs: {e}")
+
+@st.cache_data(show_spinner=False, ttl=600)
+def load_watchlist_aporte() -> pd.DataFrame:
+    return _read_ws_as_df(SHEET_ID, ABA_WATCHLIST, show_error=False)
+
+@st.cache_data(show_spinner=False, ttl=600)
+def load_regras_aporte() -> pd.DataFrame:
+    return _read_ws_as_df(SHEET_ID, ABA_REGRAS, show_error=False)
+
+@st.cache_data(show_spinner=False, ttl=600)
+def load_alertas_ativos() -> pd.DataFrame:
+    return _read_ws_as_df(SHEET_ID, ABA_ALERTAS, show_error=False)
+
+@st.cache_data(show_spinner=False, ttl=600)
+def load_limites_aporte() -> pd.DataFrame:
+    return _read_ws_as_df(SHEET_ID, ABA_LIMITES, show_error=False)
+
+# =============================================================================
+# WATCHLIST APORTE — AUTO GERAR A PARTIR DA CARTEIRA
+# =============================================================================
+
+def _canon_classe_aporte(v: Any) -> str:
+    s = str(v or "").strip().upper()
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = s.replace("Ç", "C")
+
+    if s in ("ACAO", "ACOES", "ACAOES", "AÇÃO", "AÇÕES"):
+        return "AÇÕES"
+    if s in ("FII", "FIIS"):
+        return "FII"
+    if s in ("FIAGRO", "FIAGROS"):
+        return "FIAGRO"
+    return str(v or "").strip()
+
+def _to_float_ptbr(x: Any) -> float:
+    if x is None:
+        return 0.0
+    if isinstance(x, (int, float)):
+        return float(x)
+    s = str(x).strip()
+    if not s:
+        return 0.0
+    s = s.replace("R$", "").strip()
+    if "," in s and "." in s:
+        s = s.replace(".", "").replace(",", ".")
+    else:
+        s = s.replace(",", ".")
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+
+def _write_df_to_ws_overwrite(sheet_id: str, tab_name: str, df: pd.DataFrame) -> bool:
+    """
+    Overwrite simples e robusto:
+    - limpa a aba
+    - escreve header + linhas via ws.update (USER_ENTERED)
+    """
+    try:
+        gc = _gc()
+        sh = _execute_with_retry(gc.open_by_key, sheet_id)
+        try:
+            ws = sh.worksheet(tab_name)
+        except Exception:
+            ws = sh.add_worksheet(title=tab_name, rows=max(200, len(df) + 50), cols=max(10, len(df.columns) + 5))
+
+        _execute_with_retry(ws.clear)
+
+        values = [list(df.columns)]
+        if len(df) > 0:
+            values += df.astype(str).values.tolist()
+
+        _execute_with_retry(ws.update, "A1", values, value_input_option="USER_ENTERED")
+        return True
+    except Exception:
+        return False
+
+def sync_watchlist_from_carteira(
+    overwrite: bool = False,
+    only_classes: Tuple[str, ...] = ("FII", "FIAGRO", "AÇÕES"),
+) -> Dict[str, Any]:
+    """
+    Gera a watchlist_aporte baseada na carteira (posições > 0):
+    - calcula posição por ticker usando movimentacoes
+    - classifica via ativos_master
+    - escreve em watchlist_aporte
+
+    overwrite=False: só escreve se watchlist estiver vazia
+    overwrite=True : recria tudo
+    """
+    ensure_aporte_tabs()
+
+    df_watch = load_watchlist_aporte()
+    if df_watch is not None and not df_watch.empty and not overwrite:
+        return {"written": False, "reason": "watchlist_aporte já possui linhas", "rows": int(len(df_watch))}
+
+    df_mov = load_movimentacoes()
+    df_mst = load_ativos()
+
+    if df_mov is None or df_mov.empty:
+        return {"written": False, "reason": "movimentacoes vazia", "rows": 0}
+    if df_mst is None or df_mst.empty:
+        return {"written": False, "reason": "ativos_master vazia", "rows": 0}
+
+    mov = df_mov.copy()
+    mov.columns = [str(c).strip().lower() for c in mov.columns]
+
+    # tenta achar colunas mínimas (você pode ter aliases)
+    # ticker:
+    if "ticker" not in mov.columns:
+        for alt in ["ativo", "codigo", "papel"]:
+            if alt in mov.columns:
+                mov["ticker"] = mov[alt]
+                break
+    # quantidade:
+    if "quantidade" not in mov.columns:
+        for alt in ["qtd"]:
+            if alt in mov.columns:
+                mov["quantidade"] = mov[alt]
+                break
+
+    if "ticker" not in mov.columns or "quantidade" not in mov.columns:
+        return {"written": False, "reason": "movimentacoes sem ticker/quantidade", "rows": 0}
+
+    mov["ticker"] = mov["ticker"].astype(str).str.strip().str.upper()
+    mov["quantidade"] = mov["quantidade"].apply(_to_float_ptbr)
+
+    # sinal de venda (se existir)
+    tipo_col = None
+    for c in ["tipo", "operacao", "tipo_operacao", "movimento"]:
+        if c in mov.columns:
+            tipo_col = c
+            break
+    if tipo_col:
+        t = mov[tipo_col].astype(str).str.strip().str.upper()
+        is_sell = t.isin(["VENDA", "V", "SELL"])
+        mov.loc[is_sell, "quantidade"] = mov.loc[is_sell, "quantidade"] * -1.0
+
+    pos = mov.groupby("ticker", as_index=False)["quantidade"].sum()
+    pos = pos[pos["quantidade"] > 0].copy()
+    if pos.empty:
+        return {"written": False, "reason": "carteira sem posição > 0", "rows": 0}
+
+    mst = df_mst.copy()
+    mst.columns = [str(c).strip().lower() for c in mst.columns]
+    if "ticker" not in mst.columns:
+        for alt in ["ativo", "codigo", "papel"]:
+            if alt in mst.columns:
+                mst["ticker"] = mst[alt]
+                break
+
+    cls_col = None
+    for c in ["classe", "tipo_ativo", "tipo", "categoria"]:
+        if c in mst.columns:
+            cls_col = c
+            break
+    if "ticker" not in mst.columns or cls_col is None:
+        return {"written": False, "reason": "ativos_master sem ticker/classe", "rows": 0}
+
+    mst["ticker"] = mst["ticker"].astype(str).str.strip().str.upper()
+    mst["classe_norm"] = mst[cls_col].apply(_canon_classe_aporte)
+
+    base = pos.merge(mst[["ticker", "classe_norm"]], on="ticker", how="left")
+    base = base[base["classe_norm"].isin(list(only_classes))].copy()
+    base = base.dropna(subset=["classe_norm"])
+
+    out = pd.DataFrame(
+        {
+            "ticker": base["ticker"],
+            "classe": base["classe_norm"],
+            "ativo": base["ticker"],  # compatível com seu formato atual
+            "desde_em": "",
+            "ate_em": "",
+        }
+    )
+
+    # ordena para ficar bonito
+    out["classe"] = pd.Categorical(out["classe"], categories=["FII", "FIAGRO", "AÇÕES"], ordered=True)
+    out = out.sort_values(["classe", "ticker"]).reset_index(drop=True)
+
+    tab = (ABA_WATCHLIST or "watchlist_aporte").strip()
+    ok = _write_df_to_ws_overwrite(SHEET_ID, tab, out)
+
+    if ok:
+        _clear_cached_reads()
+        return {"written": True, "rows": int(len(out))}
+    return {"written": False, "reason": "falha ao escrever watchlist_aporte", "rows": int(len(out))}
