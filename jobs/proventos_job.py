@@ -42,6 +42,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from utils.proventos_notify import notify_provento
+
+
 # =============================================================================
 # ENV
 # =============================================================================
@@ -521,12 +524,27 @@ def run() -> None:
             if vhash not in hashes_enviados:
                 hashes_enviados.add(vhash)
                 log_rows.append([_now_iso_min(), vhash, row_norm["ticker"], "ANUNCIADO", row_norm["status"]])
-                _send_telegram(
-                    "📌 Provento anunciado (NOVO)\n"
-                    f"{row_norm['ticker']} — {row_norm['tipo_pagamento']}\n"
-                    f"Com: {row_norm['data_com']} | Pag: {row_norm['data_pagamento'] or '-'}\n"
-                    f"Valor/cota: {valor_txt}"
+                ok, metodo, status, err = notify_provento(
+                    token=TELEGRAM_TOKEN,
+                    chat_id=TELEGRAM_CHAT_ID,
+                    ticker=row_norm["ticker"],
+                    evento={
+                        "tipo_pagamento": row_norm.get("tipo_pagamento"),
+                        "data_com": row_norm.get("data_com"),
+                        "data_pagamento": row_norm.get("data_pagamento"),
+                        "valor_por_cota": row_norm.get("valor_por_cota"),  # mantém full p/ cálculo, exibição vira R$ X,XX
+                    },
+                    meta={
+                        "tipo_ativo": row_norm.get("tipo_ativo") or "",
+                        "classificacao": "",        # deixa vazio por enquanto (sem chute)
+                        "acao_sugerida": "Aguardar pagamento",
+                        # "logo_url": "SUA_URL_DO_LOGO"  # opcional (melhor se você já tiver)
+                    },
+                    posicao=None,  # Actions: sem impacto por enquanto (evita IO caro)
                 )
+                if not ok:
+                    print(f"⚠️ Telegram falhou (metodo={metodo}, status={status}): {err}")
+
                 telegram_sent += 1
             continue
 
@@ -571,12 +589,26 @@ def run() -> None:
         if vhash not in hashes_enviados:
             hashes_enviados.add(vhash)
             log_rows.append([_now_iso_min(), vhash, row_norm["ticker"], "UPDATE", row_norm["status"]])
-            _send_telegram(
-                "🔁 Provento anunciado (ATUALIZADO)\n"
-                f"{row_norm['ticker']} — {row_norm['tipo_pagamento']}\n"
-                f"Com: {row_norm['data_com']} | Pag: {row_norm['data_pagamento'] or '-'}\n"
-                f"Valor/cota: {valor_txt}"
+            ok, metodo, status, err = notify_provento(
+                token=TELEGRAM_TOKEN,
+                chat_id=TELEGRAM_CHAT_ID,
+                ticker=row_norm["ticker"],
+                evento={
+                    "tipo_pagamento": row_norm.get("tipo_pagamento"),
+                    "data_com": row_norm.get("data_com"),
+                    "data_pagamento": row_norm.get("data_pagamento"),
+                    "valor_por_cota": row_norm.get("valor_por_cota"),
+                },
+                meta={
+                    "tipo_ativo": row_norm.get("tipo_ativo") or "",
+                    "classificacao": "",
+                    "acao_sugerida": "Aguardar pagamento",
+                },
+                posicao=None,
             )
+            if not ok:
+                print(f"⚠️ Telegram falhou (metodo={metodo}, status={status}): {err}")
+
             telegram_sent += 1
 
     # ================================
