@@ -13,9 +13,10 @@ Resolve de vez:
 ✅ AUTO-FIX: se a aba estiver com linhas no layout antigo (A-D = hashes), move para K-N
 ✅ AUTO-CURA: se existir linha legada só com event_id, preenche ticker/tipo_pagamento/data_com no UPDATE
 
-Observação:
-- Se você já corrompeu a aba antes, este script corrige o desalinhamento automaticamente.
-- Não precisa apagar nada manualmente.
++ ✅ NOVO (paridade Streamlit):
+✅ meta_map (logo_url / tipo_ativo / classificacao) via ativos_master
+✅ pos_map (quantidade) via movimentacoes
+✅ Telegram com bloco 📦 Impacto na sua posição + logo correto
 """
 
 from __future__ import annotations
@@ -44,6 +45,12 @@ if str(REPO_ROOT) not in sys.path:
 
 from utils.proventos_notify import notify_provento
 
+# Aba de movimentações (parametrizável por env)
+ABA_MOVIMENTACOES = (
+    os.getenv("ABA_MOVIMENTACOES_NOVO")
+    or os.getenv("ABA_LANCAMENTOS")
+    or "movimentacoes"
+)
 
 # =============================================================================
 # ENV
@@ -232,12 +239,11 @@ def _assert_or_init_header(ws: gspread.Worksheet) -> List[str]:
     return HEADER_CONTRATO
 
 def _looks_like_legacy_row(a: str, b: str, c: str, d: str) -> bool:
-    # padrão que você mostrou: A=event_id(hex40), B=0/1, C=timestamp, D=version_hash(hex40)
+    # padrão legado: A=event_id(hex40), B=0/1, C=timestamp, D=version_hash(hex40)
     if not _HEX40.match(a or ""):
         return False
     if str(b).strip() not in ("0", "1"):
         return False
-    # timestamp básico (não precisa ser perfeito)
     if not str(c).strip():
         return False
     if not _HEX40.match(d or ""):
@@ -247,27 +253,21 @@ def _looks_like_legacy_row(a: str, b: str, c: str, d: str) -> bool:
 def _fix_misaligned_legacy_rows(ws: gspread.Worksheet) -> None:
     """
     Se as linhas estão no layout antigo ocupando A-D, move A-D para K-N e limpa A-J.
-    Isso corrige exatamente o print que você mandou (ticker virou hash).
     """
     vals = ws.get_all_values()
     if len(vals) < 2:
         return
 
-    # header já foi forçado para contrato. Agora checa a primeira linha de dados.
     r2 = vals[1] + [""] * (14 - len(vals[1]))
     a, b, c, d = (str(r2[0]).strip(), str(r2[1]).strip(), str(r2[2]).strip(), str(r2[3]).strip())
 
-    # Só aplica se realmente parecer legado e se o event_id (col K) estiver vazio
-    # (evita mexer em base já correta)
     colK = r2[10] if len(r2) > 10 else ""
     if not _looks_like_legacy_row(a, b, c, d):
         return
     if str(colK).strip():
         return
 
-    # Determina o intervalo de linhas com esse padrão (até a última linha com A preenchido)
     last_row = len(vals)
-    # monta updates em batch (mais rápido e confiável em Actions)
     batch_updates = []
 
     for ridx in range(2, last_row + 1):
@@ -276,30 +276,17 @@ def _fix_misaligned_legacy_rows(ws: gspread.Worksheet) -> None:
         if not a:
             continue
         if not _looks_like_legacy_row(a, b, c, d):
-            # se misturou formatos, não tenta “metade”
             continue
 
-        # K=event_id, L=ativo, M=atualizado_em, N=version_hash
-        klnm = [a, b, c, d]
-        batch_updates.append(
-            {
-                "range": f"K{ridx}:N{ridx}",
-                "values": [klnm],
-            }
-        )
-        # limpa A-J
-        batch_updates.append(
-            {
-                "range": f"A{ridx}:J{ridx}",
-                "values": [[""] * 10],
-            }
-        )
+        klnm = [a, b, c, d]  # K..N
+        batch_updates.append({"range": f"K{ridx}:N{ridx}", "values": [klnm]})
+        batch_updates.append({"range": f"A{ridx}:J{ridx}", "values": [[""] * 10]})
 
     if batch_updates:
         ws.batch_update(batch_updates)
 
 # =============================================================================
-# Telegram
+# Telegram (fallback legado; o motor único já usa requests interno)
 # =============================================================================
 def _send_telegram(msg: str) -> None:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -312,6 +299,117 @@ def _send_telegram(msg: str) -> None:
         )
     except Exception:
         pass
+
+# =============================================================================
+# META MAP (ativos_master) — logo_url / tipo_ativo / classificacao
+# =============================================================================
+def build_meta_map_from_master(sh: gspread.Spreadsheet) -> Dict[str, Dict[str, Any]]:
+    try:
+        ws = sh.worksheet(ABA_ATIVOS_MASTER)
+    except Exception:
+        return {}
+
+    rows = _safe_get_records(ws)
+    meta: Dict[str, Dict[str, Any]] = {}
+
+    def _get(r, *keys):
+        for k in keys:
+            if k in r and str(r.get(k) or "").strip() != "":
+                return r.get(k)
+        return ""
+
+    for r in rows:
+        tk = _norm_ticker(_get(r, "ticker", "ativo", "codigo"))
+        if not tk:
+            continue
+
+        logo = str(_get(r, "logo_url", "logo", "url_logo") or "").strip()
+        if not (logo.startswith("http://") or logo.startswith("https://")):
+            logo = ""
+
+        classe = str(_get(r, "classe", "tipo_ativo") or "").strip()
+        subtipo = str(_get(r, "subtipo") or "").strip()
+        segmento = str(_get(r, "segmento") or "").strip()
+
+        # Dedup mantendo ordem (evita "Fiagro / Fiagro / Fiagro")
+        parts: List[str] = []
+        for p in [classe, subtipo, segmento]:
+            p2 = p.strip()
+            if p2 and p2.lower() not in [x.lower() for x in parts]:
+                parts.append(p2)
+        tipo_ativo = " / ".join(parts).strip()
+
+        classificacao = str(_get(r, "classificacao_capital", "classificacao") or "").strip()
+
+        meta[tk] = {
+            "logo_url": logo or None,
+            "tipo_ativo": tipo_ativo or classe or "",
+            "classificacao": classificacao or "",
+            "acao_sugerida": "Aguardar pagamento",
+        }
+
+    return meta
+
+# =============================================================================
+# POS MAP (movimentacoes) — quantidade por ticker (1 leitura)
+# =============================================================================
+def build_pos_map_from_movimentacoes(sh: gspread.Spreadsheet) -> Dict[str, float]:
+    try:
+        ws = sh.worksheet(ABA_MOVIMENTACOES)
+    except Exception:
+        return {}
+
+    rows = _safe_get_records(ws)
+    if not rows:
+        return {}
+
+    def _to_float(v: Any) -> float:
+        if v is None:
+            return 0.0
+        if isinstance(v, (int, float)):
+            return float(v)
+        st = str(v).strip()
+        if not st:
+            return 0.0
+        st = re.sub(r"[^0-9,.\-]", "", st)
+        if "," in st and "." in st:
+            st = st.replace(".", "").replace(",", ".")
+        else:
+            st = st.replace(",", ".")
+        try:
+            return float(st)
+        except Exception:
+            return 0.0
+
+    def _is_venda(tipo: Any) -> bool:
+        t = str(tipo or "").strip().upper()
+        return t in {"VENDA", "V", "SELL", "S"}
+
+    pos: Dict[str, float] = {}
+
+    for r in rows:
+        tk = _norm_ticker(
+            r.get("ticker")
+            or r.get("ativo")
+            or r.get("codigo")
+            or r.get("papel")
+            or ""
+        )
+        if not tk:
+            continue
+
+        qtd = _to_float(r.get("quantidade") or r.get("qtd") or r.get("cotas") or 0)
+        tipo = r.get("tipo_operacao") or r.get("tipo") or r.get("operacao") or r.get("tipo_de_operacao")
+
+        if _is_venda(tipo):
+            qtd *= -1.0
+
+        pos[tk] = pos.get(tk, 0.0) + qtd
+
+    # nunca negativo
+    for k in list(pos.keys()):
+        pos[k] = max(0.0, float(pos[k]))
+    return pos
 
 # =============================================================================
 # FETCH — lê tickers do ativos_master
@@ -384,6 +482,20 @@ def run() -> None:
     gc = _get_client()
     sh = gc.open_by_key(SHEET_ID)
 
+    # ✅ NOVO: carregar meta/pos UMA vez (paridade Streamlit)
+    meta_map = build_meta_map_from_master(sh)
+    pos_map = build_pos_map_from_movimentacoes(sh)
+    print(f"🧩 meta_map={len(meta_map)} | pos_map={len(pos_map)} | aba_mov='{ABA_MOVIMENTACOES}'")
+
+    # Debug opcional: se pos_map vazio, tenta mostrar chaves do sample
+    if not pos_map:
+        try:
+            ws_mov = sh.worksheet(ABA_MOVIMENTACOES)
+            sample = _safe_get_records(ws_mov)[:1]
+            print("⚠️ pos_map vazio. keys do sample:", list(sample[0].keys()) if sample else "sem linhas")
+        except Exception as e:
+            print("⚠️ falha ao inspecionar movimentacoes:", repr(e))
+
     ws_anun = _ensure_ws(sh, ABA_ANUNCIADOS, rows=8000, cols=30)
     ws_logs = _ensure_ws(sh, ABA_LOGS, rows=8000, cols=10)
 
@@ -391,7 +503,7 @@ def run() -> None:
     header = _assert_or_init_header(ws_anun)
     hmap = _col_idx_map(header)
 
-    # 2) corrige base “desalinhada” (teu print)
+    # 2) corrige base “desalinhada”
     _fix_misaligned_legacy_rows(ws_anun)
 
     # 3) garante header do logs
@@ -510,8 +622,16 @@ def run() -> None:
         row_norm["atualizado_em"] = _now_iso_min()
         row_norm["version_hash"] = vhash
 
-        valor = row_norm["valor_por_cota"]
-        valor_txt = "-" if valor is None else f"R$ {valor:.4f}"
+        # ✅ Meta + posição (paridade Streamlit)
+        meta = meta_map.get(row_norm["ticker"], {
+            "logo_url": None,
+            "tipo_ativo": row_norm.get("tipo_ativo") or "",
+            "classificacao": "",
+            "acao_sugerida": "Aguardar pagamento",
+        })
+
+        qtd = float(pos_map.get(row_norm["ticker"], 0.0) or 0.0)
+        posicao = {"qtd": qtd} if qtd > 0 else None
 
         # ----------------
         # INSERT
@@ -524,6 +644,7 @@ def run() -> None:
             if vhash not in hashes_enviados:
                 hashes_enviados.add(vhash)
                 log_rows.append([_now_iso_min(), vhash, row_norm["ticker"], "ANUNCIADO", row_norm["status"]])
+
                 ok, metodo, status, err = notify_provento(
                     token=TELEGRAM_TOKEN,
                     chat_id=TELEGRAM_CHAT_ID,
@@ -532,20 +653,16 @@ def run() -> None:
                         "tipo_pagamento": row_norm.get("tipo_pagamento"),
                         "data_com": row_norm.get("data_com"),
                         "data_pagamento": row_norm.get("data_pagamento"),
-                        "valor_por_cota": row_norm.get("valor_por_cota"),  # mantém full p/ cálculo, exibição vira R$ X,XX
+                        "valor_por_cota": row_norm.get("valor_por_cota"),
                     },
-                    meta={
-                        "tipo_ativo": row_norm.get("tipo_ativo") or "",
-                        "classificacao": "",        # deixa vazio por enquanto (sem chute)
-                        "acao_sugerida": "Aguardar pagamento",
-                        # "logo_url": "SUA_URL_DO_LOGO"  # opcional (melhor se você já tiver)
-                    },
-                    posicao=None,  # Actions: sem impacto por enquanto (evita IO caro)
+                    meta=meta,
+                    posicao=posicao,
+                    logo_url=meta.get("logo_url"),
                 )
                 if not ok:
                     print(f"⚠️ Telegram falhou (metodo={metodo}, status={status}): {err}")
-
                 telegram_sent += 1
+
             continue
 
         # ----------------
@@ -557,15 +674,15 @@ def run() -> None:
 
         # reativar soft delete
         if prev_ativo in ("0", "False", "false", ""):
-            cell_updates.append(
-                {"range": _cell_a1(hmap["ativo"], sheet_row), "values": [[1]]}
-            )
+            cell_updates.append({"range": _cell_a1(hmap["ativo"], sheet_row), "values": [[1]]})
             existing_ativo[eid] = "1"
             reactivated += 1
 
         # se versão não mudou, não atualiza
         if prev_vhash and prev_vhash == vhash:
             continue
+
+        valor = row_norm["valor_por_cota"]
 
         updates: List[Tuple[str, Any]] = [
             ("status", row_norm["status"]),
@@ -589,6 +706,7 @@ def run() -> None:
         if vhash not in hashes_enviados:
             hashes_enviados.add(vhash)
             log_rows.append([_now_iso_min(), vhash, row_norm["ticker"], "UPDATE", row_norm["status"]])
+
             ok, metodo, status, err = notify_provento(
                 token=TELEGRAM_TOKEN,
                 chat_id=TELEGRAM_CHAT_ID,
@@ -599,32 +717,25 @@ def run() -> None:
                     "data_pagamento": row_norm.get("data_pagamento"),
                     "valor_por_cota": row_norm.get("valor_por_cota"),
                 },
-                meta={
-                    "tipo_ativo": row_norm.get("tipo_ativo") or "",
-                    "classificacao": "",
-                    "acao_sugerida": "Aguardar pagamento",
-                },
-                posicao=None,
+                meta=meta,
+                posicao=posicao,
+                logo_url=meta.get("logo_url"),
             )
             if not ok:
                 print(f"⚠️ Telegram falhou (metodo={metodo}, status={status}): {err}")
-
             telegram_sent += 1
 
     # ================================
     # GRAVAÇÕES (ANTI-429)
     # ================================
-    # INSERTS em chunks
     if append_rows:
         CHUNK = 20
         for i in range(0, len(append_rows), CHUNK):
             ws_anun.append_rows(append_rows[i:i + CHUNK], value_input_option="USER_ENTERED")
 
-    # UPDATES em batch (1 request)
     if cell_updates:
         ws_anun.batch_update(cell_updates)
 
-    # LOGS em chunks
     if log_rows:
         CHUNK = 50
         for i in range(0, len(log_rows), CHUNK):
