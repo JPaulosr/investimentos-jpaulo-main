@@ -8,13 +8,16 @@ Resolve de vez:
 ✅ Upsert por event_id + version_hash
 ✅ Atualiza quando muda (não duplica)
 ✅ Soft delete (ativo=0) e reativa ao reaparecer
-✅ Anti-spam Telegram por version_hash
 ✅ Header contrato (fixo) — não duplica, não insere header aleatório
 ✅ AUTO-FIX: se a aba estiver com linhas no layout antigo (A-D = hashes), move para K-N
 ✅ AUTO-CURA: se existir linha legada só com event_id, preenche ticker/tipo_pagamento/data_com no UPDATE
 
+Telegram:
+✅ INSERT = catch-up: SE ENTROU AGORA NA PLANILHA (event_id novo), manda Telegram SEM depender do alerts_log
+✅ UPDATE = anti-spam por version_hash (alerts_log)
+
 + Resumo no final do lote (Telegram):
-✅ Se 2+ ativos notificados no run, manda 1 mensagem com total estimado e detalhe por ativo (top 15).
+✅ Se 2+ ativos realmente notificados no run, manda 1 mensagem com total estimado e detalhe por ativo (top 15).
 """
 
 from __future__ import annotations
@@ -221,7 +224,6 @@ def _assert_or_init_header(ws: gspread.Worksheet) -> List[str]:
     - Se vazio: escreve contrato
     - Se existe e já bate: ok
     - Se existe diferente: reescreve linha 1 com contrato (sem inserir nova linha)
-      (isso evita header duplicado)
     """
     vals = ws.get_all_values()
     if not vals:
@@ -236,7 +238,6 @@ def _assert_or_init_header(ws: gspread.Worksheet) -> List[str]:
     return HEADER_CONTRATO
 
 def _looks_like_legacy_row(a: str, b: str, c: str, d: str) -> bool:
-    # padrão: A=event_id(hex40), B=0/1, C=timestamp, D=version_hash(hex40)
     if not _HEX40.match(a or ""):
         return False
     if str(b).strip() not in ("0", "1"):
@@ -250,17 +251,14 @@ def _looks_like_legacy_row(a: str, b: str, c: str, d: str) -> bool:
 def _fix_misaligned_legacy_rows(ws: gspread.Worksheet) -> None:
     """
     Se as linhas estão no layout antigo ocupando A-D, move A-D para K-N e limpa A-J.
-    Isso corrige exatamente o print que você mandou (ticker virou hash).
     """
     vals = ws.get_all_values()
     if len(vals) < 2:
         return
 
-    # header já foi forçado para contrato. Agora checa a primeira linha de dados.
     r2 = vals[1] + [""] * (14 - len(vals[1]))
     a, b, c, d = (str(r2[0]).strip(), str(r2[1]).strip(), str(r2[2]).strip(), str(r2[3]).strip())
 
-    # Só aplica se realmente parecer legado e se o event_id (col K) estiver vazio
     colK = r2[10] if len(r2) > 10 else ""
     if not _looks_like_legacy_row(a, b, c, d):
         return
@@ -278,8 +276,7 @@ def _fix_misaligned_legacy_rows(ws: gspread.Worksheet) -> None:
         if not _looks_like_legacy_row(a, b, c, d):
             continue
 
-        # K=event_id, L=ativo, M=atualizado_em, N=version_hash
-        klnm = [a, b, c, d]
+        klnm = [a, b, c, d]  # K=event_id, L=ativo, M=atualizado_em, N=version_hash
         batch_updates.append({"range": f"K{ridx}:N{ridx}", "values": [klnm]})
         batch_updates.append({"range": f"A{ridx}:J{ridx}", "values": [[""] * 10]})
 
@@ -332,7 +329,6 @@ def build_meta_map_from_master(sh: gspread.Spreadsheet) -> Dict[str, Dict[str, A
         subtipo = str(_get(r, "subtipo") or "").strip()
         segmento = str(_get(r, "segmento") or "").strip()
 
-        # Dedup mantendo ordem (evita "Fiagro / Fiagro / Fiagro")
         parts: List[str] = []
         for p in [classe, subtipo, segmento]:
             p2 = p.strip()
@@ -401,7 +397,6 @@ def build_pos_map_from_movimentacoes(sh: gspread.Spreadsheet) -> Dict[str, float
 
         pos[tk] = pos.get(tk, 0.0) + qtd
 
-    # nunca negativo
     for k in list(pos.keys()):
         pos[k] = max(0.0, float(pos[k]))
     return pos
@@ -473,6 +468,7 @@ def fetch_events_from_master(sh: gspread.Spreadsheet) -> List[Dict[str, Any]]:
 # =============================================================================
 def run() -> None:
     print("🚀 Robô Proventos — schema fixo + auto-fix + batch write")
+    print(f"🔐 TELEGRAM_TOKEN set? {'SIM' if TELEGRAM_TOKEN else 'NAO'} | CHAT_ID set? {'SIM' if TELEGRAM_CHAT_ID else 'NAO'}")
 
     gc = _get_client()
     sh = gc.open_by_key(SHEET_ID)
@@ -627,41 +623,41 @@ def run() -> None:
         posicao = {"qtd": qtd} if qtd > 0 else None
 
         # ----------------
-        # INSERT
+        # INSERT  ✅ catch-up: manda SEM depender do alerts_log
         # ----------------
         if eid not in existing_by_event_id:
             append_rows.append(make_row_out(row_norm))
             inserted += 1
             existing_by_event_id[eid] = -1
 
-            if vhash not in hashes_enviados:
-                hashes_enviados.add(vhash)
-                log_rows.append([_now_iso_min(), vhash, row_norm["ticker"], "ANUNCIADO", row_norm["status"]])
+            # registra hash (idempotência do log)
+            hashes_enviados.add(vhash)
+            log_rows.append([_now_iso_min(), vhash, row_norm["ticker"], "ANUNCIADO", row_norm["status"]])
 
-                # ✅ acumula resumo APENAS se vai notificar agora
-                vpc = row_norm.get("valor_por_cota")
-                if qtd > 0 and isinstance(vpc, (int, float)) and vpc > 0:
-                    total_est = float(qtd) * float(vpc)
-                    resumo_itens.append((row_norm["ticker"], total_est))
-                    resumo_total += total_est
+            # ✅ acumula resumo (somente se houver valor e posição)
+            vpc = row_norm.get("valor_por_cota")
+            if qtd > 0 and isinstance(vpc, (int, float)) and vpc > 0:
+                total_est = float(qtd) * float(vpc)
+                resumo_itens.append((row_norm["ticker"], total_est))
+                resumo_total += total_est
 
-                ok, metodo, status, err = notify_provento(
-                    token=TELEGRAM_TOKEN,
-                    chat_id=TELEGRAM_CHAT_ID,
-                    ticker=row_norm["ticker"],
-                    evento={
-                        "tipo_pagamento": row_norm.get("tipo_pagamento"),
-                        "data_com": row_norm.get("data_com"),
-                        "data_pagamento": row_norm.get("data_pagamento"),
-                        "valor_por_cota": row_norm.get("valor_por_cota"),
-                    },
-                    meta=meta,
-                    posicao=posicao,
-                    logo_url=meta.get("logo_url"),
-                )
-                if not ok:
-                    print(f"⚠️ Telegram falhou (metodo={metodo}, status={status}): {err}")
-
+            print(f"📨 (INSERT) Enviando Telegram: {row_norm['ticker']} vhash={vhash[:8]}")
+            ok, metodo, status, err = notify_provento(
+                token=TELEGRAM_TOKEN,
+                chat_id=TELEGRAM_CHAT_ID,
+                ticker=row_norm["ticker"],
+                evento={
+                    "tipo_pagamento": row_norm.get("tipo_pagamento"),
+                    "data_com": row_norm.get("data_com"),
+                    "data_pagamento": row_norm.get("data_pagamento"),
+                    "valor_por_cota": row_norm.get("valor_por_cota"),
+                },
+                meta=meta,
+                posicao=posicao,
+                logo_url=meta.get("logo_url"),
+            )
+            print(f"📨 (INSERT) Resultado: ok={ok} metodo={metodo} status={status} err={err}")
+            if ok:
                 telegram_sent += 1
             continue
 
@@ -703,50 +699,50 @@ def run() -> None:
         existing_version_hash[eid] = vhash
         updated += 1
 
-        if vhash not in hashes_enviados:
-            hashes_enviados.add(vhash)
-            log_rows.append([_now_iso_min(), vhash, row_norm["ticker"], "UPDATE", row_norm["status"]])
+        # UPDATE: anti-spam por version_hash
+        if vhash in hashes_enviados:
+            print(f"🧱 (UPDATE) Anti-spam bloqueou: {row_norm['ticker']} vhash={vhash[:8]}")
+            continue
 
-            # ✅ acumula resumo APENAS se vai notificar agora
-            vpc = row_norm.get("valor_por_cota")
-            if qtd > 0 and isinstance(vpc, (int, float)) and vpc > 0:
-                total_est = float(qtd) * float(vpc)
-                resumo_itens.append((row_norm["ticker"], total_est))
-                resumo_total += total_est
+        hashes_enviados.add(vhash)
+        log_rows.append([_now_iso_min(), vhash, row_norm["ticker"], "UPDATE", row_norm["status"]])
 
-            ok, metodo, status, err = notify_provento(
-                token=TELEGRAM_TOKEN,
-                chat_id=TELEGRAM_CHAT_ID,
-                ticker=row_norm["ticker"],
-                evento={
-                    "tipo_pagamento": row_norm.get("tipo_pagamento"),
-                    "data_com": row_norm.get("data_com"),
-                    "data_pagamento": row_norm.get("data_pagamento"),
-                    "valor_por_cota": row_norm.get("valor_por_cota"),
-                },
-                meta=meta,
-                posicao=posicao,
-                logo_url=meta.get("logo_url"),
-            )
-            if not ok:
-                print(f"⚠️ Telegram falhou (metodo={metodo}, status={status}): {err}")
+        vpc = row_norm.get("valor_por_cota")
+        if qtd > 0 and isinstance(vpc, (int, float)) and vpc > 0:
+            total_est = float(qtd) * float(vpc)
+            resumo_itens.append((row_norm["ticker"], total_est))
+            resumo_total += total_est
 
+        print(f"📨 (UPDATE) Enviando Telegram: {row_norm['ticker']} vhash={vhash[:8]}")
+        ok, metodo, status, err = notify_provento(
+            token=TELEGRAM_TOKEN,
+            chat_id=TELEGRAM_CHAT_ID,
+            ticker=row_norm["ticker"],
+            evento={
+                "tipo_pagamento": row_norm.get("tipo_pagamento"),
+                "data_com": row_norm.get("data_com"),
+                "data_pagamento": row_norm.get("data_pagamento"),
+                "valor_por_cota": row_norm.get("valor_por_cota"),
+            },
+            meta=meta,
+            posicao=posicao,
+            logo_url=meta.get("logo_url"),
+        )
+        print(f"📨 (UPDATE) Resultado: ok={ok} metodo={metodo} status={status} err={err}")
+        if ok:
             telegram_sent += 1
 
     # ================================
     # GRAVAÇÕES (ANTI-429)
     # ================================
-    # INSERTS em chunks
     if append_rows:
         CHUNK = 20
         for i in range(0, len(append_rows), CHUNK):
             ws_anun.append_rows(append_rows[i:i + CHUNK], value_input_option="USER_ENTERED")
 
-    # UPDATES em batch (1 request)
     if cell_updates:
         ws_anun.batch_update(cell_updates)
 
-    # LOGS em chunks
     if log_rows:
         CHUNK = 50
         for i in range(0, len(log_rows), CHUNK):
@@ -756,7 +752,6 @@ def run() -> None:
     # ✅ RESUMO FINAL DO LOTE (1 msg)
     # ================================
     if len(resumo_itens) >= 2 and resumo_total > 0:
-        # agrupa por ticker (se tiver mais de 1 evento no mesmo ticker no run)
         agg: Dict[str, float] = {}
         for tk, v in resumo_itens:
             agg[tk] = agg.get(tk, 0.0) + float(v)
