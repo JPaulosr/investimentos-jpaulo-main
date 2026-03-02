@@ -183,6 +183,76 @@ def _fmt_money_br(v: float) -> str:
     s = f"{v:,.2f}"
     return s.replace(",", "X").replace(".", ",").replace("X", ".")
 
+def _fmt_date_br(iso_yyyy_mm_dd: str) -> str:
+    """Converte YYYY-MM-DD (ou DD/MM/YYYY) para DD/MM/YYYY. Retorna original se inválido."""
+    if not iso_yyyy_mm_dd:
+        return ""
+    s = str(iso_yyyy_mm_dd).strip()
+    d = _norm_date(s)
+    if not d:
+        return s
+    try:
+        return datetime.strptime(d, "%Y-%m-%d").strftime("%d/%m/%Y")
+    except Exception:
+        return s
+
+def _build_month_context(all_vals: list, hmap: dict, pos_map: dict, hoje_iso: str) -> str:
+    """Retorna 1 linha com total estimado do mês corrente (pagamentos no mesmo MM/AAAA de hoje)."""
+    try:
+        ym = (hoje_iso or "")[:7]  # YYYY-MM
+        if not ym:
+            return ""
+        idx_status = hmap.get("status")
+        idx_dp = hmap.get("data_pagamento")
+        idx_tk = hmap.get("ticker")
+        idx_vpc = hmap.get("valor_por_cota")
+        idx_ativo = hmap.get("ativo")
+        if not (idx_status and idx_dp and idx_tk and idx_vpc and idx_ativo):
+            return ""
+        total = 0.0
+        eventos = 0
+        for ridx in range(2, len(all_vals) + 1):
+            row = all_vals[ridx - 1]
+            status = str(row[idx_status - 1]).strip().upper() if idx_status - 1 < len(row) else ""
+            if status != "ANUNCIADO":
+                continue
+            ativo = str(row[idx_ativo - 1]).strip() if idx_ativo - 1 < len(row) else ""
+            if ativo in ("0", "False", "false"):
+                continue
+            dp = _norm_date(str(row[idx_dp - 1]).strip() if idx_dp - 1 < len(row) else "")
+            if not dp or not dp.startswith(ym):
+                continue
+            tk = _norm_ticker(row[idx_tk - 1]) if idx_tk - 1 < len(row) else ""
+            if not tk:
+                continue
+            qtd = float(pos_map.get(tk, 0.0) or 0.0)
+            if qtd <= 0:
+                continue
+            vpc = _norm_float(row[idx_vpc - 1] if idx_vpc - 1 < len(row) else None)
+            if vpc is None or vpc <= 0:
+                continue
+            total += float(qtd) * float(vpc)
+            eventos += 1
+        if eventos <= 0 or total <= 0:
+            return ""
+        mm_aaaa = datetime.strptime(ym + "-01", "%Y-%m-%d").strftime("%m/%Y")
+        return f"📦 Mês ({mm_aaaa}): R$ {_fmt_money_br(total)} estimado | {eventos} eventos"
+    except Exception:
+        return ""
+
+def _fmt_ddmm(iso_yyyy_mm_dd: str) -> str:
+    """Converte YYYY-MM-DD (ou DD/MM/YYYY) para DD/MM."""
+    if not iso_yyyy_mm_dd:
+        return ""
+    s = str(iso_yyyy_mm_dd).strip()
+    d = _norm_date(s)
+    if not d:
+        return ""
+    try:
+        return datetime.strptime(d, "%Y-%m-%d").strftime("%d/%m")
+    except Exception:
+        return ""
+
 # =============================================================================
 # Google Sheets
 # =============================================================================
@@ -671,7 +741,7 @@ def run() -> None:
             vpc = row_norm.get("valor_por_cota")
             if qtd > 0 and isinstance(vpc, (int, float)) and vpc > 0:
                 total_est = float(qtd) * float(vpc)
-                resumo_itens.append((row_norm["ticker"], total_est))
+                resumo_itens.append((row_norm["ticker"], total_est, row_norm.get("data_pagamento","")))
                 resumo_total += total_est
                 # ✅ acumula alerta do dia do pagamento
                 if row_norm.get("data_pagamento") == hoje_iso:
@@ -747,7 +817,7 @@ def run() -> None:
         vpc = row_norm.get("valor_por_cota")
         if qtd > 0 and isinstance(vpc, (int, float)) and vpc > 0:
             total_est = float(qtd) * float(vpc)
-            resumo_itens.append((row_norm["ticker"], total_est))
+            resumo_itens.append((row_norm["ticker"], total_est, row_norm.get("data_pagamento","")))
             resumo_total += total_est
             # ✅ acumula alerta do dia do pagamento
             if row_norm.get("data_pagamento") == hoje_iso:
@@ -830,13 +900,16 @@ def run() -> None:
             agg[tk] = agg.get(tk, 0.0) + float(v)
 
         itens_ord = sorted(agg.items(), key=lambda x: x[1], reverse=True)
-        linhas = [f"• {tk}: R$ {_fmt_money_br(val)}" for tk, val in itens_ord[:15]]
+        linhas = [f"• {_fmt_ddmm(dp)} — {tk}: R$ {_fmt_money_br(val)}" if dp else f"• {tk}: R$ {_fmt_money_br(val)}" for tk, val, dp in itens_ord[:15]]
 
+        prox = next((dp for _, _, dp in itens_ord if dp), "")
+        prox_txt = f"\n\n• Próximo pagamento: {_fmt_ddmm(prox)}" if prox else ""
         msg = (
             "📊 Resumo do lote — Proventos anunciados\n\n"
             f"Ativos: {len(itens_ord)}\n"
             f"Total estimado a receber: R$ {_fmt_money_br(float(sum(agg.values())))}\n\n"
             + "\n".join(linhas)
+            + prox_txt
         )
         _send_telegram(msg)
 
@@ -850,9 +923,9 @@ def run() -> None:
         itens_ord2 = sorted(agg2.items(), key=lambda x: x[1], reverse=True)
         hday = _sha1("PAYDAY|" + hoje_iso + "|" + ",".join([x[0] for x in itens_ord2]))
         if hday not in hashes_enviados:
-            linhas2 = [f"• {tk}: R$ {_fmt_money_br(val)}" for tk, val in itens_ord2[:12]]
+            linhas2 = [f"• {_fmt_ddmm(hoje_iso)} — {tk}: R$ {_fmt_money_br(val)}" for tk, val in itens_ord2[:12]]
             msg2 = (
-                f"📬💰 HOJE TEM PAGAMENTO — {hoje_iso}\n\n"
+                f"📬💰 HOJE TEM PAGAMENTO — {_fmt_date_br(hoje_iso)}\n\n"
                 f"Ativos pagando hoje: {len(itens_ord2)}\n"
                 f"Estimativa (carteira): R$ {_fmt_money_br(float(sum(agg2.values())))}\n\n"
                 + "\n".join(linhas2)
