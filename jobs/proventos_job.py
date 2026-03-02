@@ -627,7 +627,7 @@ def run() -> None:
     cell_updates: List[Dict[str, Any]] = []
 
     # ✅ RESUMO FINAL DO LOTE (apenas do que foi realmente notificado)
-    resumo_itens: List[Tuple[str, float]] = []
+    resumo_itens: List[Tuple[str, float, str]] = []
     resumo_total: float = 0.0
 
     # ✅ ALERTA DIÁRIO: "HOJE TEM PAGAMENTO" (consolidado)
@@ -896,22 +896,41 @@ def run() -> None:
     # ================================
     if len(resumo_itens) >= 2 and resumo_total > 0:
         agg: Dict[str, float] = {}
-        for tk, v in resumo_itens:
+        dp_min: Dict[str, str] = {}
+        for tk, v, dp in resumo_itens:
             agg[tk] = agg.get(tk, 0.0) + float(v)
+            if dp:
+                cur = dp_min.get(tk)
+                if (not cur) or (dp < cur):
+                    dp_min[tk] = dp
 
-        itens_ord = sorted(agg.items(), key=lambda x: x[1], reverse=True)
-        linhas = [f"• {_fmt_ddmm(dp)} — {tk}: R$ {_fmt_money_br(val)}" if dp else f"• {tk}: R$ {_fmt_money_br(val)}" for tk, val, dp in itens_ord[:15]]
+        itens_ord = sorted(
+            [(tk, val, dp_min.get(tk, "")) for tk, val in agg.items()],
+            key=lambda x: (x[2] or "9999-12-31", -x[1]),
+        )
+        linhas = [
+            (f"• {_fmt_ddmm(dp)} — {tk}: R$ {_fmt_money_br(val)}" if dp else f"• {tk}: R$ {_fmt_money_br(val)}")
+            for tk, val, dp in itens_ord[:15]
+        ]
 
         prox = next((dp for _, _, dp in itens_ord if dp), "")
-        prox_txt = f"\n\n• Próximo pagamento: {_fmt_ddmm(prox)}" if prox else ""
+        prox_txt = f"
+
+• Próximo pagamento: {_fmt_ddmm(prox)}" if prox else ""
         msg = (
-            "📊 Resumo do lote — Proventos anunciados\n\n"
-            f"Ativos: {len(itens_ord)}\n"
-            f"Total estimado a receber: R$ {_fmt_money_br(float(sum(agg.values())))}\n\n"
-            + "\n".join(linhas)
+            "📊 Resumo do lote — Proventos anunciados
+
+"
+            f"Ativos: {len(itens_ord)}
+"
+            f"Total estimado a receber: R$ {_fmt_money_br(float(sum(agg.values())))}
+
+"
+            + "
+".join(linhas)
             + prox_txt
         )
-        _send_telegram(msg)
+_send_telegram(msg)
 
     # ================================
     # ✅ ALERTA: HOJE TEM PAGAMENTO (1 msg/dia)
