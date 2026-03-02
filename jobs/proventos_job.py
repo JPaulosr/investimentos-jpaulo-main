@@ -785,7 +785,8 @@ def run() -> None:
             for ridx in range(2, len(all_vals) + 1):
                 row = all_vals[ridx - 1]
                 status = str(row[idx_status - 1]).strip().upper() if idx_status - 1 < len(row) else ""
-                dp = str(row[idx_dp - 1]).strip() if idx_dp - 1 < len(row) else ""
+                dp_raw = str(row[idx_dp - 1]).strip() if idx_dp - 1 < len(row) else ""
+                dp = _norm_date(dp_raw)
                 tk = _norm_ticker(row[idx_tk - 1]) if idx_tk - 1 < len(row) else ""
                 ativo = str(row[idx_ativo2 - 1]).strip() if idx_ativo2 - 1 < len(row) else ""
                 if not tk or ativo in ("0", "False", "false"):
