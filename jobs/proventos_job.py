@@ -11,13 +11,13 @@ Resolve de vez:
 ✅ Header contrato (fixo) — não duplica, não insere header aleatório
 ✅ AUTO-FIX: se a aba estiver com linhas no layout antigo (A-D = hashes), move para K-N
 ✅ AUTO-CURA: se existir linha legada só com event_id, preenche ticker/tipo_pagamento/data_com no UPDATE
-✅ IGNORA ZERADOS: Não processa, não salva e não notifica ativos que a posição em carteira é <= 0
-✅ ALERTA DE PAGAMENTO: Verifica diariamente se há pagamentos para o dia atual e envia um resumo consolidado
 
 Telegram:
 ✅ INSERT = catch-up: SE ENTROU AGORA NA PLANILHA (event_id novo), manda Telegram SEM depender do alerts_log
 ✅ UPDATE = anti-spam por version_hash (alerts_log)
-✅ PAGAMENTOS DO DIA = anti-spam via log diário (ex: PAGAMENTO_2026-03-13)
+
++ Resumo no final do lote (Telegram):
+✅ Se 2+ ativos realmente notificados no run, manda 1 mensagem com total estimado e detalhe por ativo (top 15).
 """
 
 from __future__ import annotations
@@ -28,7 +28,8 @@ import json
 import re
 import hashlib
 import traceback
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Tuple
 
 import gspread
@@ -95,13 +96,16 @@ if not GCP_JSON:
 # =============================================================================
 _HEX40 = re.compile(r"^[a-f0-9]{40}$", re.I)
 
-def _now_iso_min() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M")
+TZ_SP = ZoneInfo("America/Sao_Paulo")
 
-def _today_sp() -> str:
-    """Retorna a data atual no fuso horário de São Paulo (UTC-3)."""
-    tz_sp = timezone(timedelta(hours=-3))
-    return datetime.now(tz_sp).strftime("%Y-%m-%d")
+def _now_sp() -> datetime:
+    return datetime.now(tz=TZ_SP)
+
+def _today_sp_iso() -> str:
+    return _now_sp().strftime("%Y-%m-%d")
+
+def _now_iso_min() -> str:
+    return _now_sp().strftime("%Y-%m-%d %H:%M")
 
 def _norm_ticker(s: Any) -> str:
     if not s:
@@ -191,7 +195,7 @@ def _get_client() -> gspread.Client:
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    creds = Credentials.fromservice_account_info(info, scopes=scopes)
+    creds = Credentials.from_service_account_info(info, scopes=scopes)
     return gspread.authorize(creds)
 
 def _ensure_ws(sh: gspread.Spreadsheet, title: str, rows: int = 8000, cols: int = 30) -> gspread.Worksheet:
@@ -472,7 +476,7 @@ def fetch_events_from_master(sh: gspread.Spreadsheet) -> List[Dict[str, Any]]:
 # Engine
 # =============================================================================
 def run() -> None:
-    print("🚀 Robô Proventos — schema fixo + anti-spam zerados + pagamentos dia")
+    print("🚀 Robô Proventos — schema fixo + auto-fix + batch write")
     print(f"🔐 TELEGRAM_TOKEN set? {'SIM' if TELEGRAM_TOKEN else 'NAO'} | CHAT_ID set? {'SIM' if TELEGRAM_CHAT_ID else 'NAO'}")
 
     gc = _get_client()
@@ -537,7 +541,8 @@ def run() -> None:
     # ================================
     eventos = fetch_events_from_master(sh)
     if not eventos:
-        print("ℹ️ Nenhum evento retornado pelo fetch.")
+        print("ℹ️ Nenhum evento retornado pelo fetch. Nada a fazer.")
+        return
 
     # ================================
     # CONTADORES + BUFFERS
@@ -551,13 +556,25 @@ def run() -> None:
     log_rows: List[List[Any]] = []
     cell_updates: List[Dict[str, Any]] = []
 
-    # ✅ RESUMO FINAL DO LOTE (apenas do que foi realmente notificado neste fetch)
+    # ✅ RESUMO FINAL DO LOTE (apenas do que foi realmente notificado)
     resumo_itens: List[Tuple[str, float]] = []
     resumo_total: float = 0.0
+
+    # ✅ ALERTA DIÁRIO: "HOJE TEM PAGAMENTO" (consolidado)
+    hoje_iso = _today_sp_iso()
+    payday_itens: List[Tuple[str, float]] = []
+    payday_total: float = 0.0
 
     # ================================
     # HELPER: montar linha no layout do header
     # ================================
+    def _get_sheet_val(row: List[Any], col: str) -> str:
+        cidx = hmap.get(col.strip().lower())
+        if not cidx:
+            return ""
+        j = cidx - 1
+        return str(row[j]).strip() if j < len(row) else ""
+
     def make_row_out(row_norm: Dict[str, Any]) -> List[Any]:
         out = [""] * len(header)
 
@@ -604,12 +621,6 @@ def run() -> None:
         if not row_norm["ticker"] or not row_norm["tipo_pagamento"] or not row_norm["data_com"]:
             continue
 
-        qtd = float(pos_map.get(row_norm["ticker"], 0.0) or 0.0)
-        
-        # 🚨 REGRA NOVA: Ignora ativos que não tenho mais na carteira (posição zerada)
-        if qtd <= 0:
-            continue
-
         eid = event_id_from_row(row_norm)
         vhash = event_version_fingerprint(row_norm)
 
@@ -629,10 +640,23 @@ def run() -> None:
             },
         )
 
+        qtd = float(pos_map.get(row_norm["ticker"], 0.0) or 0.0)
         posicao = {"qtd": qtd} if qtd > 0 else None
 
+        # ✅ REGRA: se não tem posição (qtd<=0), NÃO notifica e NÃO grava.
+        #    Se o evento já existe na planilha, faz soft-delete (ativo=0) para não poluir.
+        if qtd <= 0:
+            eid_tmp = event_id_from_row(row_norm)
+            sheet_row_tmp = existing_by_event_id.get(eid_tmp)
+            if sheet_row_tmp and sheet_row_tmp > 1:
+                prev_ativo_tmp = (existing_ativo.get(eid_tmp, "") or "").strip()
+                if prev_ativo_tmp not in ("0", "False", "false"):
+                    cell_updates.append({"range": _cell_a1(hmap["ativo"], sheet_row_tmp), "values": [[0]]})
+                    existing_ativo[eid_tmp] = "0"
+            continue
+
         # ----------------
-        # INSERT
+        # INSERT  ✅ catch-up: manda SEM depender do alerts_log
         # ----------------
         if eid not in existing_by_event_id:
             append_rows.append(make_row_out(row_norm))
@@ -643,12 +667,16 @@ def run() -> None:
             hashes_enviados.add(vhash)
             log_rows.append([_now_iso_min(), vhash, row_norm["ticker"], "ANUNCIADO", row_norm["status"]])
 
-            # acumula resumo (somente se houver valor)
+            # ✅ acumula resumo (somente se houver valor e posição)
             vpc = row_norm.get("valor_por_cota")
-            if isinstance(vpc, (int, float)) and vpc > 0:
+            if qtd > 0 and isinstance(vpc, (int, float)) and vpc > 0:
                 total_est = float(qtd) * float(vpc)
                 resumo_itens.append((row_norm["ticker"], total_est))
                 resumo_total += total_est
+                # ✅ acumula alerta do dia do pagamento
+                if row_norm.get("data_pagamento") == hoje_iso:
+                    payday_itens.append((row_norm["ticker"], total_est))
+                    payday_total += total_est
 
             print(f"📨 (INSERT) Enviando Telegram: {row_norm['ticker']} vhash={vhash[:8]}")
             ok, metodo, status, err = notify_provento(
@@ -717,10 +745,14 @@ def run() -> None:
         log_rows.append([_now_iso_min(), vhash, row_norm["ticker"], "UPDATE", row_norm["status"]])
 
         vpc = row_norm.get("valor_por_cota")
-        if isinstance(vpc, (int, float)) and vpc > 0:
+        if qtd > 0 and isinstance(vpc, (int, float)) and vpc > 0:
             total_est = float(qtd) * float(vpc)
             resumo_itens.append((row_norm["ticker"], total_est))
             resumo_total += total_est
+            # ✅ acumula alerta do dia do pagamento
+            if row_norm.get("data_pagamento") == hoje_iso:
+                payday_itens.append((row_norm["ticker"], total_est))
+                payday_total += total_est
 
         print(f"📨 (UPDATE) Enviando Telegram: {row_norm['ticker']} vhash={vhash[:8]}")
         ok, metodo, status, err = notify_provento(
@@ -741,6 +773,37 @@ def run() -> None:
         if ok:
             telegram_sent += 1
 
+    # ✅ Complemento: pega também pagamentos de HOJE já existentes na planilha (ANUNCIADOS, ativo=1)
+    #    (evita perder alertas se o fetch não retornar algum item já gravado)
+    try:
+        idx_status = hmap.get("status")
+        idx_dp = hmap.get("data_pagamento")
+        idx_tk = hmap.get("ticker")
+        idx_vpc = hmap.get("valor_por_cota")
+        idx_ativo2 = hmap.get("ativo")
+        if idx_status and idx_dp and idx_tk and idx_vpc and idx_ativo2:
+            for ridx in range(2, len(all_vals) + 1):
+                row = all_vals[ridx - 1]
+                status = str(row[idx_status - 1]).strip().upper() if idx_status - 1 < len(row) else ""
+                dp = str(row[idx_dp - 1]).strip() if idx_dp - 1 < len(row) else ""
+                tk = _norm_ticker(row[idx_tk - 1]) if idx_tk - 1 < len(row) else ""
+                ativo = str(row[idx_ativo2 - 1]).strip() if idx_ativo2 - 1 < len(row) else ""
+                if not tk or ativo in ("0", "False", "false"):
+                    continue
+                if status != "ANUNCIADO" or dp != hoje_iso:
+                    continue
+                qtd = float(pos_map.get(tk, 0.0) or 0.0)
+                if qtd <= 0:
+                    continue
+                vpc = _norm_float(row[idx_vpc - 1] if idx_vpc - 1 < len(row) else None)
+                if vpc is None or vpc <= 0:
+                    continue
+                total_est = float(qtd) * float(vpc)
+                payday_itens.append((tk, total_est))
+                payday_total += total_est
+    except Exception:
+        pass
+
     # ================================
     # GRAVAÇÕES (ANTI-429)
     # ================================
@@ -752,8 +815,13 @@ def run() -> None:
     if cell_updates:
         ws_anun.batch_update(cell_updates)
 
+    if log_rows:
+        CHUNK = 50
+        for i in range(0, len(log_rows), CHUNK):
+            ws_logs.append_rows(log_rows[i:i + CHUNK], value_input_option="USER_ENTERED")
+
     # ================================
-    # ✅ RESUMO FINAL DO LOTE DE ATUALIZAÇÕES (1 msg)
+    # ✅ RESUMO FINAL DO LOTE (1 msg)
     # ================================
     if len(resumo_itens) >= 2 and resumo_total > 0:
         agg: Dict[str, float] = {}
@@ -772,74 +840,26 @@ def run() -> None:
         _send_telegram(msg)
 
     # ================================
-    # ✅ NOVO: ALERTA DIÁRIO DE PAGAMENTOS
+    # ✅ ALERTA: HOJE TEM PAGAMENTO (1 msg/dia)
     # ================================
-    hoje_iso = _today_sp()
-    hash_pagamento_hoje = f"PAGAMENTO_{hoje_iso}"
-
-    if hash_pagamento_hoje not in hashes_enviados:
-        print(f"🔎 Verificando pagamentos para hoje ({hoje_iso})...")
-        # Recarrega a aba para pegar o estado mais atual após os inserts/updates recentes
-        records_atuais = _safe_get_records(ws_anun)
-        pagamentos_hoje = []
-
-        for r in records_atuais:
-            if str(r.get("status", "")).strip().upper() == "ANUNCIADO":
-                dpag = _norm_date(r.get("data_pagamento", ""))
-                
-                if dpag == hoje_iso:
-                    tk = _norm_ticker(r.get("ticker", ""))
-                    q = float(pos_map.get(tk, 0.0) or 0.0)
-
-                    # Ignora se posição atual for zerada
-                    if q > 0:
-                        vpc = _norm_float(r.get("valor_por_cota")) or 0.0
-                        q_ref = _norm_float(r.get("quantidade_ref"))
-                        # Usa quantidade_ref se disponível, senão a posição atual mapeada
-                        q_usada = q_ref if (q_ref is not None and q_ref > 0) else q
-                        
-                        est = q_usada * vpc
-
-                        if est > 0:
-                            pagamentos_hoje.append({"ticker": tk, "estimado": est})
-
-        if pagamentos_hoje:
-            # Ordena por valor financeiro (maior impacto primeiro)
-            pagamentos_hoje.sort(key=lambda x: x["estimado"], reverse=True)
-            total_est = sum(x["estimado"] for x in pagamentos_hoje)
-
-            linhas_pag = [f"• {p['ticker']} — R$ {_fmt_money_br(p['estimado'])}" for p in pagamentos_hoje]
-            
-            # Limita a lista no Telegram para não estourar a tela se muitos pagarem no dia
-            if len(linhas_pag) > 8:
-                linhas_pag = linhas_pag[:8] + [f"• ... e mais {len(pagamentos_hoje)-8} ativos"]
-
-            parts = hoje_iso.split("-")
-            hoje_br = f"{parts[2]}/{parts[1]}/{parts[0]}"
-
-            msg_pag = (
-                f"📬💰 HOJE TEM PAGAMENTO — {hoje_br}\n\n"
-                f"✅ Ativos pagando hoje: {len(pagamentos_hoje)}\n"
-                f"💵 Estimativa de crédito (carteira): R$ {_fmt_money_br(total_est)}\n\n"
-                + "\n".join(linhas_pag) +
-                "\n\n📌 Ação: confira o extrato da corretora / lançamentos no app"
+    if payday_itens and payday_total > 0:
+        agg2: Dict[str, float] = {}
+        for tk, v in payday_itens:
+            agg2[tk] = agg2.get(tk, 0.0) + float(v)
+        itens_ord2 = sorted(agg2.items(), key=lambda x: x[1], reverse=True)
+        hday = _sha1("PAYDAY|" + hoje_iso + "|" + ",".join([x[0] for x in itens_ord2]))
+        if hday not in hashes_enviados:
+            linhas2 = [f"• {tk}: R$ {_fmt_money_br(val)}" for tk, val in itens_ord2[:12]]
+            msg2 = (
+                f"📬💰 HOJE TEM PAGAMENTO — {hoje_iso}\n\n"
+                f"Ativos pagando hoje: {len(itens_ord2)}\n"
+                f"Estimativa (carteira): R$ {_fmt_money_br(float(sum(agg2.values())))}\n\n"
+                + "\n".join(linhas2)
+                + "\n\n📌 Ação: confira o extrato da corretora / lançamentos no app"
             )
-
-            _send_telegram(msg_pag)
-            
-            # Registra no log para garantir que só seja enviado uma vez no dia
-            log_rows.append([_now_iso_min(), hash_pagamento_hoje, "ALL", "PAGAMENTO_DIA", "ENVIADO"])
-            print(f"📨 (PAGAMENTO DIA) Alerta diário enviado com sucesso! ({len(pagamentos_hoje)} ativos)")
-        else:
-            print("ℹ️ Nenhum pagamento programado para hoje ou posição zerada nos ativos pagadores.")
-    else:
-        print("ℹ️ Alerta de pagamentos de hoje já foi enviado anteriormente.")
-
-    # Grava os logs só no final para incluir o hash do pagamento diário
-    if log_rows:
-        CHUNK = 50
-        for i in range(0, len(log_rows), CHUNK):
-            ws_logs.append_rows(log_rows[i:i + CHUNK], value_input_option="USER_ENTERED")
+            _send_telegram(msg2)
+            hashes_enviados.add(hday)
+            log_rows.append([_now_iso_min(), hday, "*", "PAYDAY", hoje_iso])
 
     print(f"✅ Inseridos: {inserted}")
     print(f"🔁 Atualizados: {updated}")
