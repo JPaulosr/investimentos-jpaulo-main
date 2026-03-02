@@ -914,26 +914,17 @@ def run() -> None:
         ]
 
         prox = next((dp for _, _, dp in itens_ord if dp), "")
-        prox_txt = f"
-
-• Próximo pagamento: {_fmt_ddmm(prox)}" if prox else ""
+        prox_txt = f"\n\n• Próximo pagamento: {_fmt_ddmm(prox)}" if prox else ""
         msg = (
-            "📊 Resumo do lote — Proventos anunciados
-
-"
-            f"Ativos: {len(itens_ord)}
-"
-            f"Total estimado a receber: R$ {_fmt_money_br(float(sum(agg.values())))}
-
-"
-            + "
-".join(linhas)
+            "📊 Resumo do lote — Proventos anunciados\n\n"
+            f"Ativos: {len(itens_ord)}\n"
+            f"Total estimado a receber: R$ {_fmt_money_br(float(sum(agg.values())))}\n\n"
+            + "\n".join(linhas)
             + prox_txt
         )
-_send_telegram(msg)
+        _send_telegram(msg)
 
-    # ================================
-    # ✅ ALERTA: HOJE TEM PAGAMENTO (1 msg/dia)
+# ✅ ALERTA: HOJE TEM PAGAMENTO (1 msg/dia)
     # ================================
     if payday_itens and payday_total > 0:
         agg2: Dict[str, float] = {}
