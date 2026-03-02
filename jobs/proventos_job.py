@@ -148,16 +148,19 @@ def _sha1(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
 def event_id_from_row(row: Dict[str, Any]) -> str:
+    """ID estável do evento (não muda quando data_pagamento aparece depois).
+
+    Contrato: ticker + tipo_pagamento + data_com.
+    data_pagamento NÃO entra no ID para evitar duplicar eventos quando a data é atualizada.
+    """
     key = "|".join(
         [
             _norm_ticker(row.get("ticker", "")),
             str(row.get("tipo_pagamento", "") or "").strip().upper(),
             _norm_date(row.get("data_com", "")),
-            _norm_date(row.get("data_pagamento", "")),  # ✅ entra no ID
         ]
     )
     return _sha1(key)
-
 def event_version_fingerprint(row: Dict[str, Any]) -> str:
     v = _norm_float(row.get("valor_por_cota", None))
     vtxt = "" if v is None else f"{float(v):.8f}"
@@ -404,7 +407,7 @@ def build_pos_map_from_movimentacoes(sh: gspread.Spreadsheet) -> Dict[str, float
 # =============================================================================
 # FETCH — lê tickers do ativos_master
 # =============================================================================
-def fetch_events_from_master(sh: gspread.Spreadsheet) -> List[Dict[str, Any]]:
+def fetch_events_from_master(sh: gspread.Spreadsheet, tickers_allow: Optional[set[str]] = None) -> List[Dict[str, Any]]:
     try:
         ws = sh.worksheet(ABA_ATIVOS_MASTER)
     except Exception:
@@ -423,6 +426,11 @@ def fetch_events_from_master(sh: gspread.Spreadsheet) -> List[Dict[str, Any]]:
             tickers.append(t)
 
     tickers = sorted(set(tickers))
+
+    # ✅ filtra tickers pela carteira atual (posicao > 0)
+    if tickers_allow is not None:
+        tickers = [t for t in tickers if t in tickers_allow]
+
     if not tickers:
         print(f"❌ Nenhum ticker válido encontrado em '{ABA_ATIVOS_MASTER}'.")
         return []
@@ -530,7 +538,9 @@ def run() -> None:
     # ================================
     # FETCH REAL
     # ================================
-    eventos = fetch_events_from_master(sh)
+    # ✅ busca somente para ativos com posição > 0 (evita anunciar/avisar ativos zerados)
+    tickers_allow = {tk for tk, q in pos_map.items() if float(q or 0) > 0}
+    eventos = fetch_events_from_master(sh, tickers_allow=tickers_allow)
     if not eventos:
         print("ℹ️ Nenhum evento retornado pelo fetch. Nada a fazer.")
         return
@@ -628,7 +638,7 @@ def run() -> None:
         if eid not in existing_by_event_id:
             append_rows.append(make_row_out(row_norm))
             inserted += 1
-            existing_by_event_id[eid] = -1
+            existing_by_event_id[eid] = 0  # marcado como inserido neste run (sem row index)
 
             # registra hash (idempotência do log)
             hashes_enviados.add(vhash)
@@ -642,6 +652,9 @@ def run() -> None:
                 resumo_total += total_est
 
             print(f"📨 (INSERT) Enviando Telegram: {row_norm['ticker']} vhash={vhash[:8]}")
+            # ✅ não notificar / não considerar se ativo não está mais em carteira (posição 0)
+            if float(pos_map.get(row_norm.get('ticker',''), 0) or 0) <= 0:
+                continue
             ok, metodo, status, err = notify_provento(
                 token=TELEGRAM_TOKEN,
                 chat_id=TELEGRAM_CHAT_ID,
@@ -665,6 +678,9 @@ def run() -> None:
         # UPDATE (BATCH)
         # ----------------
         sheet_row = existing_by_event_id[eid]
+            if sheet_row <= 1:
+                # inserido agora neste run ou linha inválida → evita update com range quebrado
+                continue
         prev_vhash = existing_version_hash.get(eid, "")
         prev_ativo = (existing_ativo.get(eid, "") or "").strip()
 
@@ -714,6 +730,9 @@ def run() -> None:
             resumo_total += total_est
 
         print(f"📨 (UPDATE) Enviando Telegram: {row_norm['ticker']} vhash={vhash[:8]}")
+            # ✅ não notificar / não considerar se ativo não está mais em carteira (posição 0)
+            if float(pos_map.get(row_norm.get('ticker',''), 0) or 0) <= 0:
+                continue
         ok, metodo, status, err = notify_provento(
             token=TELEGRAM_TOKEN,
             chat_id=TELEGRAM_CHAT_ID,
