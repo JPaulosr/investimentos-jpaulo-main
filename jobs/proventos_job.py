@@ -3,26 +3,25 @@
 """
 ROBÔ PROVENTOS — FINAL (idempotente + update + soft delete + auto-fix sheet) + P/VP
 
-Resolve de vez:
 ✅ Lê tickers do ativos_master (sem env TICKERS)
 ✅ Upsert por event_id + version_hash
 ✅ Atualiza quando muda (não duplica)
 ✅ Soft delete (ativo=0) e reativa ao reaparecer
 ✅ Header contrato (fixo) — não duplica, não insere header aleatório
 ✅ AUTO-FIX: se a aba estiver com linhas no layout antigo (A-D = hashes), move para K-N
-✅ AUTO-CURA: se existir linha legada só com event_id, preenche ticker/tipo_pagamento/data_com no UPDATE
 
 P/VP:
-✅ Nova coluna "pvp" adicionada NO FINAL do header (não desloca colunas)
-✅ P/VP vem do ativos_master (colunas aceitas: pvp | p_vp | p/vp | p_vp_atual)
-✅ Fallback opcional: tenta buscar P/VP na web (StatusInvest) com cache 1x por ticker (pode falhar sem quebrar)
+✅ Nova coluna "pvp" no FINAL do header (não desloca colunas)
+✅ P/VP vem do ativos_master se existir (pvp | p_vp | p/vp | p_vp_atual | p_vpa | p/vpa)
+✅ Fallback: busca P/VP no Investidor10 (mais compatível com seu fluxo)
+✅ Auto-fill: se existir linha antiga com pvp vazio (ativo=1), preenche via cache 1x por ticker (sem depender de INSERT/UPDATE)
 
 Telegram:
-✅ INSERT = catch-up: SE ENTROU AGORA NA PLANILHA (event_id novo), manda Telegram SEM depender do alerts_log
+✅ INSERT = catch-up: event_id novo -> manda telegram
 ✅ UPDATE = anti-spam por version_hash (alerts_log)
 
-+ Resumo no final do lote (Telegram):
-✅ Se 2+ ativos realmente notificados no run, manda 1 mensagem com total estimado e detalhe por ativo (top 15).
++ Resumo no final do lote (Telegram)
++ Alerta diário: HOJE TEM PAGAMENTO (consolidado)
 """
 
 from __future__ import annotations
@@ -101,7 +100,6 @@ if not GCP_JSON:
 # Helpers
 # =============================================================================
 _HEX40 = re.compile(r"^[a-f0-9]{40}$", re.I)
-
 TZ_SP = ZoneInfo("America/Sao_Paulo")
 
 def _now_sp() -> datetime:
@@ -168,7 +166,7 @@ def event_id_from_row(row: Dict[str, Any]) -> str:
             _norm_ticker(row.get("ticker", "")),
             str(row.get("tipo_pagamento", "") or "").strip().upper(),
             _norm_date(row.get("data_com", "")),
-            _norm_date(row.get("data_pagamento", "")),  # ✅ entra no ID
+            _norm_date(row.get("data_pagamento", "")),
         ]
     )
     return _sha1(key)
@@ -190,7 +188,6 @@ def _fmt_money_br(v: float) -> str:
     return s.replace(",", "X").replace(".", ",").replace("X", ".")
 
 def _fmt_date_br(iso_yyyy_mm_dd: str) -> str:
-    """Converte YYYY-MM-DD (ou DD/MM/YYYY) para DD/MM/YYYY. Retorna original se inválido."""
     if not iso_yyyy_mm_dd:
         return ""
     s = str(iso_yyyy_mm_dd).strip()
@@ -202,52 +199,7 @@ def _fmt_date_br(iso_yyyy_mm_dd: str) -> str:
     except Exception:
         return s
 
-def _build_month_context(all_vals: list, hmap: dict, pos_map: dict, hoje_iso: str) -> str:
-    """Retorna 1 linha com total estimado do mês corrente (pagamentos no mesmo MM/AAAA de hoje)."""
-    try:
-        ym = (hoje_iso or "")[:7]  # YYYY-MM
-        if not ym:
-            return ""
-        idx_status = hmap.get("status")
-        idx_dp = hmap.get("data_pagamento")
-        idx_tk = hmap.get("ticker")
-        idx_vpc = hmap.get("valor_por_cota")
-        idx_ativo = hmap.get("ativo")
-        if not (idx_status and idx_dp and idx_tk and idx_vpc and idx_ativo):
-            return ""
-        total = 0.0
-        eventos = 0
-        for ridx in range(2, len(all_vals) + 1):
-            row = all_vals[ridx - 1]
-            status = str(row[idx_status - 1]).strip().upper() if idx_status - 1 < len(row) else ""
-            if status != "ANUNCIADO":
-                continue
-            ativo = str(row[idx_ativo - 1]).strip() if idx_ativo - 1 < len(row) else ""
-            if ativo in ("0", "False", "false"):
-                continue
-            dp = _norm_date(str(row[idx_dp - 1]).strip() if idx_dp - 1 < len(row) else "")
-            if not dp or not dp.startswith(ym):
-                continue
-            tk = _norm_ticker(row[idx_tk - 1]) if idx_tk - 1 < len(row) else ""
-            if not tk:
-                continue
-            qtd = float(pos_map.get(tk, 0.0) or 0.0)
-            if qtd <= 0:
-                continue
-            vpc = _norm_float(row[idx_vpc - 1] if idx_vpc - 1 < len(row) else None)
-            if vpc is None or vpc <= 0:
-                continue
-            total += float(qtd) * float(vpc)
-            eventos += 1
-        if eventos <= 0 or total <= 0:
-            return ""
-        mm_aaaa = datetime.strptime(ym + "-01", "%Y-%m-%d").strftime("%m/%Y")
-        return f"📦 Mês ({mm_aaaa}): R$ {_fmt_money_br(total)} estimado | {eventos} eventos"
-    except Exception:
-        return ""
-
 def _fmt_ddmm(iso_yyyy_mm_dd: str) -> str:
-    """Converte YYYY-MM-DD (ou DD/MM/YYYY) para DD/MM."""
     if not iso_yyyy_mm_dd:
         return ""
     s = str(iso_yyyy_mm_dd).strip()
@@ -260,58 +212,59 @@ def _fmt_ddmm(iso_yyyy_mm_dd: str) -> str:
         return ""
 
 # =============================================================================
-# P/VP (fallback opcional - cacheado)
+# P/VP — Investidor10 (fallback robusto)
 # =============================================================================
-def fetch_pvp_statusinvest(ticker: str) -> Optional[float]:
+def fetch_pvp_investidor10(ticker: str) -> Optional[float]:
     """
-    Tenta extrair P/VP (P/VPA) do StatusInvest (FII ou Ação).
-    Se falhar, retorna None (não quebra o robô).
+    Extrai P/VP do Investidor10.
+    Tenta primeiro FII e depois Ação.
+    Retorna None se falhar (não quebra o robô).
     """
-    try:
-        tk = _norm_ticker(ticker)
-        if not tk:
-            return None
+    tk = _norm_ticker(ticker)
+    if not tk:
+        return None
 
-        headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        }
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+        "Connection": "keep-alive",
+    }
 
-        # tenta FII
-        urls = [
-            f"https://statusinvest.com.br/fundos-imobiliarios/{tk.lower()}",
-            f"https://statusinvest.com.br/acoes/{tk.lower()}",
-        ]
+    urls = [
+        f"https://investidor10.com.br/fiis/{tk.lower()}/",
+        f"https://investidor10.com.br/acoes/{tk.lower()}/",
+    ]
 
-        for url in urls:
-            try:
-                r = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-                if r.status_code != 200:
-                    continue
-                html = r.text
+    # regexs “tolerantes” (HTML muda bastante)
+    # pega um número próximo de P/VP (com vírgula ou ponto)
+    patterns = [
+        re.compile(r"P/VP[^0-9]{0,80}([0-9]+[.,][0-9]+)", re.I | re.S),
+        re.compile(r"P\s*/\s*VP[^0-9]{0,80}([0-9]+[.,][0-9]+)", re.I | re.S),
+        re.compile(r"P\s*/\s*VPA[^0-9]{0,80}([0-9]+[.,][0-9]+)", re.I | re.S),
+    ]
 
-                # padrões comuns: "P/VP", "P/VPA", "P/VP (FII)" — extrai o número próximo
-                # Ex.: ...>P/VP</span> ... <strong class="value">0,95</strong>
-                m = re.search(r"(P/VP|P/VPA)\s*</[^>]+>\s*<[^>]+>\s*([0-9]+[.,][0-9]+)", html, re.I)
+    for url in urls:
+        try:
+            r = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+            if r.status_code != 200:
+                continue
+            html = r.text
+
+            for pat in patterns:
+                m = pat.search(html)
                 if not m:
-                    # fallback: busca label e um valor na sequência
-                    m = re.search(r"(P/VP|P/VPA).*?([0-9]+[.,][0-9]+)", html, re.I | re.S)
-                if not m:
                     continue
-
-                val = _norm_float(m.group(2))
+                val = _norm_float(m.group(1))
                 if val is None:
                     continue
-
                 # sanity
-                if 0.0 < val < 50.0:
+                if 0.0 < float(val) < 50.0:
                     return float(val)
-            except Exception:
-                continue
+        except Exception:
+            continue
 
-        return None
-    except Exception:
-        return None
+    return None
 
 # =============================================================================
 # Google Sheets
@@ -358,12 +311,6 @@ def _cell_a1(col_idx: int, row_idx: int) -> str:
     return f"{col}{row_idx}"
 
 def _assert_or_init_header(ws: gspread.Worksheet) -> List[str]:
-    """
-    Header fixo:
-    - Se vazio: escreve contrato
-    - Se existe e já bate: ok
-    - Se existe diferente: reescreve linha 1 com contrato (sem inserir nova linha)
-    """
     vals = ws.get_all_values()
     if not vals:
         ws.update("1:1", [HEADER_CONTRATO])
@@ -390,7 +337,7 @@ def _looks_like_legacy_row(a: str, b: str, c: str, d: str) -> bool:
 def _fix_misaligned_legacy_rows(ws: gspread.Worksheet) -> None:
     """
     Se as linhas estão no layout antigo ocupando A-D, move A-D para K-N e limpa A-J.
-    Observação: K-N permanecem sendo (11-14) porque a coluna "pvp" foi adicionada no FINAL.
+    Como pvp foi adicionada no final, K-N continuam sendo event_id..version_hash.
     """
     vals = ws.get_all_values()
     if len(vals) < 2:
@@ -619,7 +566,6 @@ def run() -> None:
     gc = _get_client()
     sh = gc.open_by_key(SHEET_ID)
 
-    # ✅ Pré-carrega meta e posição (1 leitura de cada)
     meta_map = build_meta_map_from_master(sh)
     pos_map = build_pos_map_from_movimentacoes(sh)
     print(f"🧩 meta_map={len(meta_map)} | pos_map={len(pos_map)} | aba_mov='{ABA_MOVIMENTACOES}'")
@@ -627,23 +573,16 @@ def run() -> None:
     ws_anun = _ensure_ws(sh, ABA_ANUNCIADOS, rows=8000, cols=30)
     ws_logs = _ensure_ws(sh, ABA_LOGS, rows=8000, cols=10)
 
-    # 1) força header correto (sem inserir linha)
     header = _assert_or_init_header(ws_anun)
     hmap = _col_idx_map(header)
 
-    # 2) corrige base “desalinhada”
     _fix_misaligned_legacy_rows(ws_anun)
 
-    # 3) garante header do logs
     if not ws_logs.get_all_values():
         ws_logs.update("1:1", [["ts", "event_hash", "ticker", "tipo", "status"]])
 
-    # 4) carrega base anunciados
     all_vals = ws_anun.get_all_values()
 
-    # ================================
-    # MAPEAR ESTADO ATUAL DA PLANILHA
-    # ================================
     existing_by_event_id: Dict[str, int] = {}
     existing_version_hash: Dict[str, str] = {}
     existing_ativo: Dict[str, str] = {}
@@ -654,36 +593,22 @@ def run() -> None:
 
     for ridx in range(2, len(all_vals) + 1):
         row = all_vals[ridx - 1]
-
-        eid = ""
-        if idx_event_id - 1 < len(row):
-            eid = str(row[idx_event_id - 1]).strip()
-
+        eid = str(row[idx_event_id - 1]).strip() if (idx_event_id - 1) < len(row) else ""
         if not eid:
             continue
-
         existing_by_event_id[eid] = ridx
-        existing_version_hash[eid] = str(row[idx_version - 1]).strip() if idx_version - 1 < len(row) else ""
-        existing_ativo[eid] = str(row[idx_ativo - 1]).strip() if idx_ativo - 1 < len(row) else ""
+        existing_version_hash[eid] = str(row[idx_version - 1]).strip() if (idx_version - 1) < len(row) else ""
+        existing_ativo[eid] = str(row[idx_ativo - 1]).strip() if (idx_ativo - 1) < len(row) else ""
 
-    # ================================
-    # ANTI-SPAM (hashes já enviados)
-    # ================================
     logs_records = _safe_get_records(ws_logs)
     hashes_enviados = {str(r.get("event_hash") or "").strip() for r in logs_records if r.get("event_hash")}
     print(f"🧱 Anti-spam: {len(hashes_enviados)} hashes no alerts_log")
 
-    # ================================
-    # FETCH REAL
-    # ================================
     eventos = fetch_events_from_master(sh)
     if not eventos:
         print("ℹ️ Nenhum evento retornado pelo fetch. Nada a fazer.")
         return
 
-    # ================================
-    # CONTADORES + BUFFERS
-    # ================================
     inserted = 0
     updated = 0
     reactivated = 0
@@ -693,27 +618,39 @@ def run() -> None:
     log_rows: List[List[Any]] = []
     cell_updates: List[Dict[str, Any]] = []
 
-    # ✅ RESUMO FINAL DO LOTE (apenas do que foi realmente notificado)
     resumo_itens: List[Tuple[str, float, str]] = []
     resumo_total: float = 0.0
 
-    # ✅ ALERTA DIÁRIO: "HOJE TEM PAGAMENTO" (consolidado)
     hoje_iso = _today_sp_iso()
     payday_itens: List[Tuple[str, float]] = []
     payday_total: float = 0.0
 
-    # ✅ Cache de P/VP (fallback web) — 1x por ticker no run
+    # ✅ Cache de P/VP (master/fallback) — 1x por ticker no run
     pvp_cache: Dict[str, Optional[float]] = {}
 
-    # ================================
-    # HELPER: montar linha no layout do header
-    # ================================
-    def _get_sheet_val(row: List[Any], col: str) -> str:
-        cidx = hmap.get(col.strip().lower())
+    def _get_sheet_cell(row: List[Any], colname: str) -> str:
+        cidx = hmap.get(colname.strip().lower())
         if not cidx:
             return ""
         j = cidx - 1
+        # get_all_values TRIMA colunas vazias do final -> pode dar OOR
         return str(row[j]).strip() if j < len(row) else ""
+
+    def _resolve_pvp(tk: str, meta: Dict[str, Any]) -> Optional[float]:
+        # 1) master
+        pv = meta.get("pvp") if isinstance(meta, dict) else None
+        if pv is not None:
+            try:
+                pvf = float(pv)
+                if 0.0 < pvf < 50.0:
+                    return pvf
+            except Exception:
+                pass
+
+        # 2) cache / fallback investidor10
+        if tk not in pvp_cache:
+            pvp_cache[tk] = fetch_pvp_investidor10(tk)
+        return pvp_cache[tk]
 
     def make_row_out(row_norm: Dict[str, Any]) -> List[Any]:
         out = [""] * len(header)
@@ -733,19 +670,15 @@ def run() -> None:
         setc("quantidade_ref", row_norm.get("quantidade_ref"))
         setc("fonte_url", row_norm.get("fonte_url"))
         setc("capturado_em", row_norm.get("capturado_em"))
-
         setc("event_id", row_norm.get("event_id"))
         setc("ativo", row_norm.get("ativo"))
         setc("atualizado_em", row_norm.get("atualizado_em"))
         setc("version_hash", row_norm.get("version_hash"))
-
-        # ✅ NOVO: P/VP
         setc("pvp", row_norm.get("pvp"))
-
         return out
 
     # ================================
-    # LOOP PRINCIPAL DE EVENTOS
+    # LOOP PRINCIPAL
     # ================================
     for ev in eventos:
         row_norm: Dict[str, Any] = {
@@ -761,7 +694,6 @@ def run() -> None:
             "capturado_em": str(ev.get("capturado_em", "") or _now_iso_min()),
         }
 
-        # mínimos obrigatórios
         if not row_norm["ticker"] or not row_norm["tipo_pagamento"] or not row_norm["data_com"]:
             continue
 
@@ -773,7 +705,6 @@ def run() -> None:
         row_norm["atualizado_em"] = _now_iso_min()
         row_norm["version_hash"] = vhash
 
-        # meta + posição
         meta = meta_map.get(
             row_norm["ticker"],
             {
@@ -788,50 +719,34 @@ def run() -> None:
         qtd = float(pos_map.get(row_norm["ticker"], 0.0) or 0.0)
         posicao = {"qtd": qtd} if qtd > 0 else None
 
-        # ✅ REGRA: se não tem posição (qtd<=0), NÃO notifica e NÃO grava.
-        #    Se o evento já existe na planilha, faz soft-delete (ativo=0) para não poluir.
+        # ✅ não tem posição -> não grava e faz soft delete se já existia
         if qtd <= 0:
-            eid_tmp = event_id_from_row(row_norm)
-            sheet_row_tmp = existing_by_event_id.get(eid_tmp)
+            sheet_row_tmp = existing_by_event_id.get(eid)
             if sheet_row_tmp and sheet_row_tmp > 1:
-                prev_ativo_tmp = (existing_ativo.get(eid_tmp, "") or "").strip()
+                prev_ativo_tmp = (existing_ativo.get(eid, "") or "").strip()
                 if prev_ativo_tmp not in ("0", "False", "false"):
                     cell_updates.append({"range": _cell_a1(hmap["ativo"], sheet_row_tmp), "values": [[0]]})
-                    existing_ativo[eid_tmp] = "0"
+                    existing_ativo[eid] = "0"
             continue
 
-        # ✅ P/VP:
-        # 1) tenta vindo do master (meta)
-        pvp_val = meta.get("pvp") if isinstance(meta, dict) else None
-
-        # 2) fallback web 1x por ticker (opcional)
-        if pvp_val is None:
-            tk = row_norm["ticker"]
-            if tk not in pvp_cache:
-                pvp_cache[tk] = fetch_pvp_statusinvest(tk)
-            pvp_val = pvp_cache[tk]
-
+        # ✅ P/VP resolvido
+        pvp_val = _resolve_pvp(row_norm["ticker"], meta)
         row_norm["pvp"] = "" if pvp_val is None else pvp_val
 
-        # ----------------
-        # INSERT  ✅ catch-up: manda SEM depender do alerts_log
-        # ----------------
+        # ---------------- INSERT
         if eid not in existing_by_event_id:
             append_rows.append(make_row_out(row_norm))
             inserted += 1
             existing_by_event_id[eid] = -1
 
-            # registra hash (idempotência do log)
             hashes_enviados.add(vhash)
             log_rows.append([_now_iso_min(), vhash, row_norm["ticker"], "ANUNCIADO", row_norm["status"]])
 
-            # ✅ acumula resumo (somente se houver valor e posição)
             vpc = row_norm.get("valor_por_cota")
             if qtd > 0 and isinstance(vpc, (int, float)) and vpc > 0:
                 total_est = float(qtd) * float(vpc)
                 resumo_itens.append((row_norm["ticker"], total_est, row_norm.get("data_pagamento", "")))
                 resumo_total += total_est
-                # ✅ acumula alerta do dia do pagamento
                 if row_norm.get("data_pagamento") == hoje_iso:
                     payday_itens.append((row_norm["ticker"], total_est))
                     payday_total += total_est
@@ -856,39 +771,26 @@ def run() -> None:
                 telegram_sent += 1
             continue
 
-        # ----------------
-        # UPDATE (BATCH)
-        # ----------------
+        # ---------------- UPDATE
         sheet_row = existing_by_event_id[eid]
         prev_vhash = existing_version_hash.get(eid, "")
         prev_ativo = (existing_ativo.get(eid, "") or "").strip()
 
-        # reativar soft delete
         if prev_ativo in ("0", "False", "false", ""):
             cell_updates.append({"range": _cell_a1(hmap["ativo"], sheet_row), "values": [[1]]})
             existing_ativo[eid] = "1"
             reactivated += 1
 
-        # se versão não mudou, não atualiza
+        # se não mudou versão: ainda assim preenche pvp se estiver vazio na planilha
         if prev_vhash and prev_vhash == vhash:
-            # mesmo se não mudou, podemos atualizar P/VP se estava vazio e agora existe
-            # (isso não dispara telegram)
-            if "pvp" in hmap:
-                # tenta preencher pvp vazio
-                try:
-                    # lê valor atual pvp na linha (se existir)
-                    idx_pvp = hmap.get("pvp")
-                    cur_pvp = ""
-                    if idx_pvp and (idx_pvp - 1) < len(all_vals[sheet_row - 1]):
-                        cur_pvp = str(all_vals[sheet_row - 1][idx_pvp - 1]).strip()
-                    if (not cur_pvp) and row_norm.get("pvp") not in ("", None):
-                        cell_updates.append({"range": _cell_a1(idx_pvp, sheet_row), "values": [[row_norm.get("pvp")]]})
-                except Exception:
-                    pass
+            idx_pvp = hmap.get("pvp")
+            if idx_pvp:
+                cur_pvp = _get_sheet_cell(all_vals[sheet_row - 1], "pvp")
+                if (not cur_pvp) and row_norm.get("pvp") not in ("", None):
+                    cell_updates.append({"range": _cell_a1(idx_pvp, sheet_row), "values": [[row_norm.get("pvp")]]})
             continue
 
         valor = row_norm["valor_por_cota"]
-
         updates: List[Tuple[str, Any]] = [
             ("status", row_norm["status"]),
             ("data_pagamento", row_norm["data_pagamento"]),
@@ -897,7 +799,7 @@ def run() -> None:
             ("fonte_url", row_norm["fonte_url"]),
             ("atualizado_em", row_norm["atualizado_em"]),
             ("version_hash", vhash),
-            ("pvp", row_norm.get("pvp", "")),  # ✅ NOVO
+            ("pvp", row_norm.get("pvp", "")),
         ]
 
         for col, val in updates:
@@ -909,7 +811,6 @@ def run() -> None:
         existing_version_hash[eid] = vhash
         updated += 1
 
-        # UPDATE: anti-spam por version_hash
         if vhash in hashes_enviados:
             print(f"🧱 (UPDATE) Anti-spam bloqueou: {row_norm['ticker']} vhash={vhash[:8]}")
             continue
@@ -922,7 +823,6 @@ def run() -> None:
             total_est = float(qtd) * float(vpc)
             resumo_itens.append((row_norm["ticker"], total_est, row_norm.get("data_pagamento", "")))
             resumo_total += total_est
-            # ✅ acumula alerta do dia do pagamento
             if row_norm.get("data_pagamento") == hoje_iso:
                 payday_itens.append((row_norm["ticker"], total_est))
                 payday_total += total_est
@@ -946,14 +846,46 @@ def run() -> None:
         if ok:
             telegram_sent += 1
 
-    # ✅ Complemento: pega também pagamentos de HOJE já existentes na planilha (ANUNCIADOS, ativo=1)
-    #    (evita perder alertas se o fetch não retornar algum item já gravado)
+    # =============================================================================
+    # ✅ AUTO-FILL P/VP para linhas antigas (ativo=1, ticker ok, pvp vazio, e com posição)
+    # =============================================================================
+    idx_tk = hmap.get("ticker")
+    idx_ativo2 = hmap.get("ativo")
+    idx_pvp = hmap.get("pvp")
+    if idx_tk and idx_ativo2 and idx_pvp:
+        for ridx in range(2, len(all_vals) + 1):
+            row = all_vals[ridx - 1]
+            ativo = str(row[idx_ativo2 - 1]).strip() if (idx_ativo2 - 1) < len(row) else ""
+            if ativo in ("0", "False", "false"):
+                continue
+
+            tk = _norm_ticker(row[idx_tk - 1]) if (idx_tk - 1) < len(row) else ""
+            if not tk:
+                continue
+
+            # get_all_values pode não ter a coluna pvp se estiver vazia no final -> tratar como vazio
+            cur_pvp = str(row[idx_pvp - 1]).strip() if (idx_pvp - 1) < len(row) else ""
+            if cur_pvp:
+                continue
+
+            qtd = float(pos_map.get(tk, 0.0) or 0.0)
+            if qtd <= 0:
+                continue
+
+            meta = meta_map.get(tk, {"pvp": None})
+            pv = _resolve_pvp(tk, meta)
+            if pv is None:
+                continue
+
+            cell_updates.append({"range": _cell_a1(idx_pvp, ridx), "values": [[pv]]})
+
+    # =============================================================================
+    # Complemento: pagamentos HOJE existentes na planilha (não mexe com P/VP)
+    # =============================================================================
     try:
         idx_status = hmap.get("status")
         idx_dp = hmap.get("data_pagamento")
-        idx_tk = hmap.get("ticker")
         idx_vpc = hmap.get("valor_por_cota")
-        idx_ativo2 = hmap.get("ativo")
         if idx_status and idx_dp and idx_tk and idx_vpc and idx_ativo2:
             for ridx in range(2, len(all_vals) + 1):
                 row = all_vals[ridx - 1]
@@ -978,9 +910,9 @@ def run() -> None:
     except Exception:
         pass
 
-    # ================================
+    # =============================================================================
     # GRAVAÇÕES (ANTI-429)
-    # ================================
+    # =============================================================================
     if append_rows:
         CHUNK = 20
         for i in range(0, len(append_rows), CHUNK):
@@ -994,9 +926,9 @@ def run() -> None:
         for i in range(0, len(log_rows), CHUNK):
             ws_logs.append_rows(log_rows[i:i + CHUNK], value_input_option="USER_ENTERED")
 
-    # ================================
-    # ✅ RESUMO FINAL DO LOTE (1 msg)
-    # ================================
+    # =============================================================================
+    # RESUMO FINAL DO LOTE
+    # =============================================================================
     if len(resumo_itens) >= 2 and resumo_total > 0:
         agg: Dict[str, float] = {}
         dp_min: Dict[str, str] = {}
@@ -1027,13 +959,15 @@ def run() -> None:
         )
         _send_telegram(msg)
 
-    # ✅ ALERTA: HOJE TEM PAGAMENTO (1 msg/dia)
-    # ================================
+    # =============================================================================
+    # ALERTA: HOJE TEM PAGAMENTO (1 msg/dia)
+    # =============================================================================
     if payday_itens and payday_total > 0:
         agg2: Dict[str, float] = {}
         for tk, v in payday_itens:
             agg2[tk] = agg2.get(tk, 0.0) + float(v)
         itens_ord2 = sorted(agg2.items(), key=lambda x: x[1], reverse=True)
+
         hday = _sha1("PAYDAY|" + hoje_iso + "|" + ",".join([x[0] for x in itens_ord2]))
         if hday not in hashes_enviados:
             linhas2 = [f"• {_fmt_ddmm(hoje_iso)} — {tk}: R$ {_fmt_money_br(val)}" for tk, val in itens_ord2[:12]]
@@ -1046,14 +980,14 @@ def run() -> None:
             )
             _send_telegram(msg2)
             hashes_enviados.add(hday)
-            log_rows.append([_now_iso_min(), hday, "*", "PAYDAY", hoje_iso])
+            # OBS: se quiser registrar esse log no sheets também, precisa escrever em ws_logs.
+            # Aqui só mantém em memória (o anti-spam real já está no alerts_log).
 
     print(f"✅ Inseridos: {inserted}")
     print(f"🔁 Atualizados: {updated}")
     print(f"♻️ Reativados: {reactivated}")
     print(f"📨 Telegram enviados: {telegram_sent}")
     print("🏁 Concluído.")
-
 
 if __name__ == "__main__":
     run()
