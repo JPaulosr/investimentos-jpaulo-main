@@ -32,6 +32,7 @@ import json
 import re
 import hashlib
 import traceback
+import pandas as pd
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Tuple
@@ -39,6 +40,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import gspread
 import requests
 from google.oauth2.service_account import Credentials
+from utils.snapshot_carteira import atualizar_snapshot_carteira
 
 # =============================================================================
 # ✅ GARANTE IMPORTS DO REPO (Actions)
@@ -959,7 +961,7 @@ def run() -> None:
         )
         _send_telegram(msg)
 
-    # =============================================================================
+       # =============================================================================
     # ALERTA: HOJE TEM PAGAMENTO (1 msg/dia)
     # =============================================================================
     if payday_itens and payday_total > 0:
@@ -980,14 +982,56 @@ def run() -> None:
             )
             _send_telegram(msg2)
             hashes_enviados.add(hday)
-            # OBS: se quiser registrar esse log no sheets também, precisa escrever em ws_logs.
-            # Aqui só mantém em memória (o anti-spam real já está no alerts_log).
 
     print(f"✅ Inseridos: {inserted}")
     print(f"🔁 Atualizados: {updated}")
     print(f"♻️ Reativados: {reactivated}")
     print(f"📨 Telegram enviados: {telegram_sent}")
+
+    # =============================================================================
+    # 🔄 ATUALIZA SNAPSHOT CARTEIRA (sempre ao final do job)
+    # =============================================================================
+    print("🔄 Atualizando snapshot carteira...")
+    atualizar_snapshot_posicoes(sh)
+
     print("🏁 Concluído.")
+
+
+# =============================================================================
+# SNAPSHOT CARTEIRA (executado após o robô)
+# =============================================================================
+def atualizar_snapshot_posicoes(sh):
+    try:
+        ws_pos = sh.worksheet("posicoes_snapshot")
+        ws_cot = sh.worksheet("cotacoes_cache")
+        ws_prov = sh.worksheet("proventos")
+        ws_anun = sh.worksheet("proventos_anunciados")
+        ws_master = sh.worksheet("ativos_master")
+
+        df_pos = pd.DataFrame(ws_pos.get_all_records())
+        df_cot = pd.DataFrame(ws_cot.get_all_records())
+        df_prov = pd.DataFrame(ws_prov.get_all_records())
+        df_anun = pd.DataFrame(ws_anun.get_all_records())
+        df_master = pd.DataFrame(ws_master.get_all_records())
+
+        df_snapshot = atualizar_snapshot_carteira(
+            df_pos,
+            df_cot,
+            df_prov,
+            df_anun,
+            df_master,
+        )
+
+        ws_pos.clear()
+        ws_pos.update(
+            [df_snapshot.columns.tolist()] + df_snapshot.values.tolist()
+        )
+
+        print("📊 Snapshot carteira atualizado com sucesso.")
+
+    except Exception as e:
+        print("❌ Erro ao atualizar snapshot carteira:", e)
+
 
 if __name__ == "__main__":
     run()
