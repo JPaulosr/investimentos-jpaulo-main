@@ -37,20 +37,20 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Tuple
 
-import gspread
-import requests
-from google.oauth2.service_account import Credentials
-from utils.snapshot_carteira import atualizar_snapshot_carteira
-
 # =============================================================================
-# ✅ GARANTE IMPORTS DO REPO (Actions)
+# ✅ GARANTE IMPORTS DO REPO (GitHub Actions / execução via jobs/)
 # =============================================================================
 from pathlib import Path
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+import gspread
+import requests
+from google.oauth2.service_account import Credentials
+
+# ✅ imports do repo (agora funciona)
+from utils.snapshot_carteira import atualizar_snapshot_carteira
 from utils.proventos_notify import notify_provento
 
 ABA_MOVIMENTACOES = os.getenv("ABA_MOVIMENTACOES_NOVO") or os.getenv("ABA_LANCAMENTOS") or "movimentacoes"
