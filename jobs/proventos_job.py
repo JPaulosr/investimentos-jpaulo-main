@@ -1,7 +1,7 @@
 # jobs/proventos_job.py
 # -*- coding: utf-8 -*-
 """
-ROBÔ PROVENTOS — FINAL (idempotente + update + soft delete + auto-fix sheet)
+ROBÔ PROVENTOS — FINAL (idempotente + update + soft delete + auto-fix sheet) + P/VP
 
 Resolve de vez:
 ✅ Lê tickers do ativos_master (sem env TICKERS)
@@ -11,6 +11,11 @@ Resolve de vez:
 ✅ Header contrato (fixo) — não duplica, não insere header aleatório
 ✅ AUTO-FIX: se a aba estiver com linhas no layout antigo (A-D = hashes), move para K-N
 ✅ AUTO-CURA: se existir linha legada só com event_id, preenche ticker/tipo_pagamento/data_com no UPDATE
+
+P/VP:
+✅ Nova coluna "pvp" adicionada NO FINAL do header (não desloca colunas)
+✅ P/VP vem do ativos_master (colunas aceitas: pvp | p_vp | p/vp | p_vp_atual)
+✅ Fallback opcional: tenta buscar P/VP na web (StatusInvest) com cache 1x por ticker (pode falhar sem quebrar)
 
 Telegram:
 ✅ INSERT = catch-up: SE ENTROU AGORA NA PLANILHA (event_id novo), manda Telegram SEM depender do alerts_log
@@ -84,6 +89,7 @@ HEADER_CONTRATO = [
     "ativo",
     "atualizado_em",
     "version_hash",
+    "pvp",  # ✅ NOVA COLUNA (no final para não deslocar nada)
 ]
 
 if not SHEET_ID:
@@ -254,6 +260,60 @@ def _fmt_ddmm(iso_yyyy_mm_dd: str) -> str:
         return ""
 
 # =============================================================================
+# P/VP (fallback opcional - cacheado)
+# =============================================================================
+def fetch_pvp_statusinvest(ticker: str) -> Optional[float]:
+    """
+    Tenta extrair P/VP (P/VPA) do StatusInvest (FII ou Ação).
+    Se falhar, retorna None (não quebra o robô).
+    """
+    try:
+        tk = _norm_ticker(ticker)
+        if not tk:
+            return None
+
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+
+        # tenta FII
+        urls = [
+            f"https://statusinvest.com.br/fundos-imobiliarios/{tk.lower()}",
+            f"https://statusinvest.com.br/acoes/{tk.lower()}",
+        ]
+
+        for url in urls:
+            try:
+                r = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+                if r.status_code != 200:
+                    continue
+                html = r.text
+
+                # padrões comuns: "P/VP", "P/VPA", "P/VP (FII)" — extrai o número próximo
+                # Ex.: ...>P/VP</span> ... <strong class="value">0,95</strong>
+                m = re.search(r"(P/VP|P/VPA)\s*</[^>]+>\s*<[^>]+>\s*([0-9]+[.,][0-9]+)", html, re.I)
+                if not m:
+                    # fallback: busca label e um valor na sequência
+                    m = re.search(r"(P/VP|P/VPA).*?([0-9]+[.,][0-9]+)", html, re.I | re.S)
+                if not m:
+                    continue
+
+                val = _norm_float(m.group(2))
+                if val is None:
+                    continue
+
+                # sanity
+                if 0.0 < val < 50.0:
+                    return float(val)
+            except Exception:
+                continue
+
+        return None
+    except Exception:
+        return None
+
+# =============================================================================
 # Google Sheets
 # =============================================================================
 def _get_client() -> gspread.Client:
@@ -330,12 +390,14 @@ def _looks_like_legacy_row(a: str, b: str, c: str, d: str) -> bool:
 def _fix_misaligned_legacy_rows(ws: gspread.Worksheet) -> None:
     """
     Se as linhas estão no layout antigo ocupando A-D, move A-D para K-N e limpa A-J.
+    Observação: K-N permanecem sendo (11-14) porque a coluna "pvp" foi adicionada no FINAL.
     """
     vals = ws.get_all_values()
     if len(vals) < 2:
         return
 
-    r2 = vals[1] + [""] * (14 - len(vals[1]))
+    L = max(len(HEADER_CONTRATO), 15)
+    r2 = vals[1] + [""] * (L - len(vals[1]))
     a, b, c, d = (str(r2[0]).strip(), str(r2[1]).strip(), str(r2[2]).strip(), str(r2[3]).strip())
 
     colK = r2[10] if len(r2) > 10 else ""
@@ -348,7 +410,7 @@ def _fix_misaligned_legacy_rows(ws: gspread.Worksheet) -> None:
     batch_updates = []
 
     for ridx in range(2, last_row + 1):
-        row = (vals[ridx - 1] + [""] * 14)[:14]
+        row = (vals[ridx - 1] + [""] * L)[:L]
         a, b, c, d = (str(row[0]).strip(), str(row[1]).strip(), str(row[2]).strip(), str(row[3]).strip())
         if not a:
             continue
@@ -378,7 +440,7 @@ def _send_telegram(msg: str) -> None:
         pass
 
 # =============================================================================
-# META (ativos_master) — logo_url / tipo_ativo / classificacao
+# META (ativos_master) — logo_url / tipo_ativo / classificacao / pvp
 # =============================================================================
 def build_meta_map_from_master(sh: gspread.Spreadsheet) -> Dict[str, Dict[str, Any]]:
     try:
@@ -417,11 +479,16 @@ def build_meta_map_from_master(sh: gspread.Spreadsheet) -> Dict[str, Dict[str, A
 
         classificacao = str(_get(r, "classificacao_capital", "classificacao") or "").strip()
 
+        # ✅ P/VP vindo do master (se existir)
+        pvp_raw = _get(r, "pvp", "p_vp", "p/vp", "p_vp_atual", "p_vpa", "p/vpa")
+        pvp = _norm_float(pvp_raw)
+
         meta[tk] = {
             "logo_url": logo or None,
             "tipo_ativo": tipo_ativo or classe or "",
             "classificacao": classificacao or "",
             "acao_sugerida": "Aguardar pagamento",
+            "pvp": pvp,
         }
 
     return meta
@@ -546,7 +613,7 @@ def fetch_events_from_master(sh: gspread.Spreadsheet) -> List[Dict[str, Any]]:
 # Engine
 # =============================================================================
 def run() -> None:
-    print("🚀 Robô Proventos — schema fixo + auto-fix + batch write")
+    print("🚀 Robô Proventos — schema fixo + auto-fix + batch write + P/VP")
     print(f"🔐 TELEGRAM_TOKEN set? {'SIM' if TELEGRAM_TOKEN else 'NAO'} | CHAT_ID set? {'SIM' if TELEGRAM_CHAT_ID else 'NAO'}")
 
     gc = _get_client()
@@ -635,6 +702,9 @@ def run() -> None:
     payday_itens: List[Tuple[str, float]] = []
     payday_total: float = 0.0
 
+    # ✅ Cache de P/VP (fallback web) — 1x por ticker no run
+    pvp_cache: Dict[str, Optional[float]] = {}
+
     # ================================
     # HELPER: montar linha no layout do header
     # ================================
@@ -668,6 +738,10 @@ def run() -> None:
         setc("ativo", row_norm.get("ativo"))
         setc("atualizado_em", row_norm.get("atualizado_em"))
         setc("version_hash", row_norm.get("version_hash"))
+
+        # ✅ NOVO: P/VP
+        setc("pvp", row_norm.get("pvp"))
+
         return out
 
     # ================================
@@ -707,6 +781,7 @@ def run() -> None:
                 "tipo_ativo": row_norm.get("tipo_ativo") or "",
                 "classificacao": "",
                 "acao_sugerida": "Aguardar pagamento",
+                "pvp": None,
             },
         )
 
@@ -725,6 +800,19 @@ def run() -> None:
                     existing_ativo[eid_tmp] = "0"
             continue
 
+        # ✅ P/VP:
+        # 1) tenta vindo do master (meta)
+        pvp_val = meta.get("pvp") if isinstance(meta, dict) else None
+
+        # 2) fallback web 1x por ticker (opcional)
+        if pvp_val is None:
+            tk = row_norm["ticker"]
+            if tk not in pvp_cache:
+                pvp_cache[tk] = fetch_pvp_statusinvest(tk)
+            pvp_val = pvp_cache[tk]
+
+        row_norm["pvp"] = "" if pvp_val is None else pvp_val
+
         # ----------------
         # INSERT  ✅ catch-up: manda SEM depender do alerts_log
         # ----------------
@@ -741,7 +829,7 @@ def run() -> None:
             vpc = row_norm.get("valor_por_cota")
             if qtd > 0 and isinstance(vpc, (int, float)) and vpc > 0:
                 total_est = float(qtd) * float(vpc)
-                resumo_itens.append((row_norm["ticker"], total_est, row_norm.get("data_pagamento","")))
+                resumo_itens.append((row_norm["ticker"], total_est, row_norm.get("data_pagamento", "")))
                 resumo_total += total_est
                 # ✅ acumula alerta do dia do pagamento
                 if row_norm.get("data_pagamento") == hoje_iso:
@@ -783,6 +871,20 @@ def run() -> None:
 
         # se versão não mudou, não atualiza
         if prev_vhash and prev_vhash == vhash:
+            # mesmo se não mudou, podemos atualizar P/VP se estava vazio e agora existe
+            # (isso não dispara telegram)
+            if "pvp" in hmap:
+                # tenta preencher pvp vazio
+                try:
+                    # lê valor atual pvp na linha (se existir)
+                    idx_pvp = hmap.get("pvp")
+                    cur_pvp = ""
+                    if idx_pvp and (idx_pvp - 1) < len(all_vals[sheet_row - 1]):
+                        cur_pvp = str(all_vals[sheet_row - 1][idx_pvp - 1]).strip()
+                    if (not cur_pvp) and row_norm.get("pvp") not in ("", None):
+                        cell_updates.append({"range": _cell_a1(idx_pvp, sheet_row), "values": [[row_norm.get("pvp")]]})
+                except Exception:
+                    pass
             continue
 
         valor = row_norm["valor_por_cota"]
@@ -795,6 +897,7 @@ def run() -> None:
             ("fonte_url", row_norm["fonte_url"]),
             ("atualizado_em", row_norm["atualizado_em"]),
             ("version_hash", vhash),
+            ("pvp", row_norm.get("pvp", "")),  # ✅ NOVO
         ]
 
         for col, val in updates:
@@ -817,7 +920,7 @@ def run() -> None:
         vpc = row_norm.get("valor_por_cota")
         if qtd > 0 and isinstance(vpc, (int, float)) and vpc > 0:
             total_est = float(qtd) * float(vpc)
-            resumo_itens.append((row_norm["ticker"], total_est, row_norm.get("data_pagamento","")))
+            resumo_itens.append((row_norm["ticker"], total_est, row_norm.get("data_pagamento", "")))
             resumo_total += total_est
             # ✅ acumula alerta do dia do pagamento
             if row_norm.get("data_pagamento") == hoje_iso:
@@ -924,7 +1027,7 @@ def run() -> None:
         )
         _send_telegram(msg)
 
-# ✅ ALERTA: HOJE TEM PAGAMENTO (1 msg/dia)
+    # ✅ ALERTA: HOJE TEM PAGAMENTO (1 msg/dia)
     # ================================
     if payday_itens and payday_total > 0:
         agg2: Dict[str, float] = {}
