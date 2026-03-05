@@ -32,6 +32,7 @@ import json
 import re
 import hashlib
 import traceback
+import time as _time
 import pandas as pd
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -569,7 +570,6 @@ def run() -> None:
     sh = gc.open_by_key(SHEET_ID)
 
     # ── Batch read: lê 4 abas em 1 request para não estourar quota ──────────
-    import time as _time
     _ABA_NAMES = {
         "master": ABA_ATIVOS_MASTER,
         "mov":    ABA_MOVIMENTACOES,
