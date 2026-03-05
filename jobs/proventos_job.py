@@ -1161,25 +1161,27 @@ def atualizar_snapshot_posicoes(sh):
         # get_all_records() retorna strings com vírgula ("0,12") quando a
         # planilha está em pt-BR. Isso corrompe todos os cálculos numéricos.
         def _fix_br_decimals(df: pd.DataFrame, cols: list) -> pd.DataFrame:
-            # Só converte strings que contêm vírgula (formato pt-BR: "1,23" ou "1.234,56").
-            # Valores com ponto decimal ("0.07") já estão corretos — não tocar.
-            def _parse_cell(v):
-                if isinstance(v, (int, float)):
-                    return v
-                s = str(v).strip()
-                if not s or s in ("", "nan", "None"):
-                    return float("nan")
-                if "," in s:
-                    # pt-BR: remove pontos de milhar, troca vírgula por ponto
-                    s = s.replace(".", "").replace(",", ".")
-                try:
-                    return float(s)
-                except ValueError:
-                    return float("nan")
-            for c in cols:
-                if c in df.columns:
-                    df[c] = df[c].apply(_parse_cell)
-            return df
+
+    def _parse(v):
+        if v is None:
+            return float("nan")
+
+        s = str(v).strip()
+
+        if not s or s.lower() == "nan":
+            return float("nan")
+
+        # formato brasileiro
+        if "," in s:
+            s = s.replace(".", "").replace(",", ".")
+
+        return float(s)
+
+    for c in cols:
+        if c in df.columns:
+            df[c] = df[c].apply(_parse)
+
+    return df
 
         df_prov = _fix_br_decimals(df_prov, ["valor", "valor_por_cota", "quantidade_na_data"])
         df_cot  = _fix_br_decimals(df_cot,  ["preco"])
