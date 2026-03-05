@@ -1157,57 +1157,9 @@ def atualizar_snapshot_posicoes(sh):
         df_anun   = pd.DataFrame(ws_anun.get_all_records())
         df_master = pd.DataFrame(ws_master.get_all_records())
 
-        # ── Normalizar decimais pt-BR → float antes de passar ao snapshot ────
-        # get_all_records() retorna strings com vírgula ("0,12") quando a
-        # planilha está em pt-BR. Isso corrompe todos os cálculos numéricos.
-        def _fix_br_decimals(df: pd.DataFrame, cols: list) -> pd.DataFrame:
-
-        def _parse(v):
-            if v is None:
-                return float("nan")
-    
-            s = str(v).strip()
-    
-            if not s or s.lower() == "nan":
-                return float("nan")
-    
-            # formato brasileiro
-            if "," in s:
-                s = s.replace(".", "").replace(",", ".")
-    
-            try:
-                return float(s)
-            except:
-                return float("nan")
-    
-        for c in cols:
-            if c in df.columns:
-                df[c] = df[c].apply(_parse)
-    
-        return df
-
-        df_prov = _fix_br_decimals(df_prov, ["valor", "valor_por_cota", "quantidade_na_data"])
-        df_cot  = _fix_br_decimals(df_cot,  ["preco"])
-        df_pos  = _fix_br_decimals(df_pos,  ["quantidade", "preco_medio"])
-        df_anun = _fix_br_decimals(df_anun, ["valor_por_cota", "pvp"])
-        
-        # 🔧 NORMALIZAR ESCALA DO PREÇO MÉDIO
-        def _normalizar_preco(v):
-            try:
-                v = float(v)
-            except:
-                return v
-        
-            if v > 500:   # provavelmente está 100x maior
-                return v / 100
-        
-            return v
-        
-        df_pos["preco_medio"] = df_pos["preco_medio"].apply(_normalizar_preco)
-        
+        # snapshot_carteira._to_num lida com pt-BR e en-US automaticamente
 
         # Garantir que posicoes_snapshot só tem as colunas base antes de calcular
-        cols_base = [c for c in ["ticker", "quantidade", "preco_medio"] if c in df_pos.columns]
         df_pos = df_pos[cols_base].copy()
 
         df_snapshot = atualizar_snapshot_carteira(
