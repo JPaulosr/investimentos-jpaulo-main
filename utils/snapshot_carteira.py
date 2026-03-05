@@ -13,13 +13,7 @@ from datetime import datetime
 
 
 def _to_num(series: pd.Series) -> pd.Series:
-    return (
-        series.astype(str)
-        .str.replace(".", "", regex=False)
-        .str.replace(",", ".", regex=False)
-        .replace("", np.nan)
-        .astype(float)
-    )
+    return pd.to_numeric(series, errors="coerce")
 
 
 def atualizar_snapshot_carteira(
