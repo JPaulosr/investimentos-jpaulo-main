@@ -1162,26 +1162,29 @@ def atualizar_snapshot_posicoes(sh):
         # planilha está em pt-BR. Isso corrompe todos os cálculos numéricos.
         def _fix_br_decimals(df: pd.DataFrame, cols: list) -> pd.DataFrame:
 
-    def _parse(v):
-        if v is None:
-            return float("nan")
-
-        s = str(v).strip()
-
-        if not s or s.lower() == "nan":
-            return float("nan")
-
-        # formato brasileiro
-        if "," in s:
-            s = s.replace(".", "").replace(",", ".")
-
-        return float(s)
-
-    for c in cols:
-        if c in df.columns:
-            df[c] = df[c].apply(_parse)
-
-    return df
+        def _parse(v):
+            if v is None:
+                return float("nan")
+    
+            s = str(v).strip()
+    
+            if not s or s.lower() == "nan":
+                return float("nan")
+    
+            # formato brasileiro
+            if "," in s:
+                s = s.replace(".", "").replace(",", ".")
+    
+            try:
+                return float(s)
+            except:
+                return float("nan")
+    
+        for c in cols:
+            if c in df.columns:
+                df[c] = df[c].apply(_parse)
+    
+        return df
 
         df_prov = _fix_br_decimals(df_prov, ["valor", "valor_por_cota", "quantidade_na_data"])
         df_cot  = _fix_br_decimals(df_cot,  ["preco"])
