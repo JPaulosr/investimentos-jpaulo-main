@@ -1187,6 +1187,21 @@ def atualizar_snapshot_posicoes(sh):
         df_cot  = _fix_br_decimals(df_cot,  ["preco"])
         df_pos  = _fix_br_decimals(df_pos,  ["quantidade", "preco_medio"])
         df_anun = _fix_br_decimals(df_anun, ["valor_por_cota", "pvp"])
+        
+        # 🔧 NORMALIZAR ESCALA DO PREÇO MÉDIO
+        def _normalizar_preco(v):
+            try:
+                v = float(v)
+            except:
+                return v
+        
+            if v > 500:   # provavelmente está 100x maior
+                return v / 100
+        
+            return v
+        
+        df_pos["preco_medio"] = df_pos["preco_medio"].apply(_normalizar_preco)
+        
 
         # Garantir que posicoes_snapshot só tem as colunas base antes de calcular
         cols_base = [c for c in ["ticker", "quantidade", "preco_medio"] if c in df_pos.columns]
