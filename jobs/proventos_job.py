@@ -1151,11 +1151,20 @@ def atualizar_snapshot_posicoes(sh):
         ws_anun   = sh.worksheet("proventos_anunciados")
         ws_master = sh.worksheet("ativos_master")
 
-        df_pos    = pd.DataFrame(ws_pos.get_all_records())
-        df_cot    = pd.DataFrame(ws_cot.get_all_records())
-        df_prov   = pd.DataFrame(ws_prov.get_all_records())
-        df_anun   = pd.DataFrame(ws_anun.get_all_records())
-        df_master = pd.DataFrame(ws_master.get_all_records())
+        # value_render_option="UNFORMATTED_VALUE" retorna o valor numérico bruto
+        # sem aplicar formatação do locale pt-BR (evita 24.22 → 2422).
+        def _ws_to_df(ws):
+            data = ws.get_all_values(value_render_option="UNFORMATTED_VALUE")
+            if not data or len(data) < 2:
+                return pd.DataFrame()
+            headers = [str(h).strip() for h in data[0]]
+            return pd.DataFrame(data[1:], columns=headers)
+
+        df_pos    = _ws_to_df(ws_pos)
+        df_cot    = _ws_to_df(ws_cot)
+        df_prov   = _ws_to_df(ws_prov)
+        df_anun   = _ws_to_df(ws_anun)
+        df_master = _ws_to_df(ws_master)
 
         # snapshot_carteira._to_num lida com pt-BR e en-US automaticamente
 
@@ -1175,8 +1184,12 @@ def atualizar_snapshot_posicoes(sh):
                 return v.strftime("%Y-%m-%d %H:%M")
             if v is None or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
                 return ""
-            if isinstance(v, (int, float)):
-                return float(v)
+            if isinstance(v, float):
+                # Gravar como string com ponto decimal explícito.
+                # float(v) com RAW ainda sofre influência do locale pt-BR no Sheets.
+                return str(v)
+            if isinstance(v, int):
+                return v
             return v
 
         rows_out = [df_snapshot.columns.tolist()]
