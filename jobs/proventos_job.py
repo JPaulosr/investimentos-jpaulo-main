@@ -379,15 +379,18 @@ def _fix_misaligned_legacy_rows(ws: gspread.Worksheet) -> None:
 # =============================================================================
 def _send_telegram(msg: str) -> None:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️ Telegram: TOKEN ou CHAT_ID não definidos")
         return
     try:
-        requests.post(
+        r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
             timeout=REQUEST_TIMEOUT,
         )
-    except Exception:
-        pass
+        if not r.ok:
+            print(f"⚠️ Telegram erro {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print(f"⚠️ Telegram exception: {e}")
 
 # =============================================================================
 # META (ativos_master) — logo_url / tipo_ativo / classificacao / pvp
@@ -1127,7 +1130,7 @@ def run() -> None:
     # 🔄 ATUALIZA SNAPSHOT CARTEIRA (sempre ao final do job)
     # =============================================================================
     print("🔄 Atualizando snapshot carteira...")
-    atualizar_snapshot_posicoes(sh)
+    atualizar_snapshot_posicoes(sh, pos_map)
 
     print("🏁 Concluído.")
 
@@ -1135,7 +1138,7 @@ def run() -> None:
 # =============================================================================
 # SNAPSHOT CARTEIRA (executado após o robô)
 # =============================================================================
-def atualizar_snapshot_posicoes(sh):
+def atualizar_snapshot_posicoes(sh, pos_map):
     """
     Lê posicoes_snapshot (fonte imutável: ticker, quantidade, preco_medio)
     e grava o resultado calculado em carteira_snapshot (aba separada).
@@ -1151,8 +1154,7 @@ def atualizar_snapshot_posicoes(sh):
         ws_anun   = sh.worksheet("proventos_anunciados")
         ws_master = sh.worksheet("ativos_master")
 
-        # value_render_option="UNFORMATTED_VALUE" retorna o valor numérico bruto
-        # sem aplicar formatação do locale pt-BR (evita 24.22 → 2422).
+        # UNFORMATTED_VALUE: retorna número bruto sem locale pt-BR (evita 24.22→2422)
         def _ws_to_df(ws):
             data = ws.get_all_values(value_render_option="UNFORMATTED_VALUE")
             if not data or len(data) < 2:
@@ -1160,16 +1162,38 @@ def atualizar_snapshot_posicoes(sh):
             headers = [str(h).strip() for h in data[0]]
             return pd.DataFrame(data[1:], columns=headers)
 
-        df_pos    = _ws_to_df(ws_pos)
         df_cot    = _ws_to_df(ws_cot)
         df_prov   = _ws_to_df(ws_prov)
         df_anun   = _ws_to_df(ws_anun)
         df_master = _ws_to_df(ws_master)
 
-        # snapshot_carteira._to_num lida com pt-BR e en-US automaticamente
+        # ── Sincronizar posicoes_snapshot a partir das movimentacoes ─────────
+        # pos_map já foi calculado no início do job (fonte de verdade).
+        # Preserva preco_medio atual do Sheets, só atualiza quantidade.
+        df_pos_atual = _ws_to_df(ws_pos)
+        pm_map = {}
+        if not df_pos_atual.empty and "ticker" in df_pos_atual.columns and "preco_medio" in df_pos_atual.columns:
+            for _, r in df_pos_atual.iterrows():
+                tk = str(r["ticker"]).strip()
+                try:
+                    pm_map[tk] = float(r["preco_medio"])
+                except Exception:
+                    pass
 
-        # Garantir que posicoes_snapshot só tem as colunas base antes de calcular
-        df_pos = df_pos[cols_base].copy()
+        pos_rows = [["ticker", "quantidade", "preco_medio"]]
+        for tk in sorted(pos_map.keys()):
+            qtd = pos_map[tk]
+            if qtd <= 0:
+                continue  # posição zerada — remove
+            pm = pm_map.get(tk, "")
+            pos_rows.append([tk, str(qtd), str(pm)])
+
+        ws_pos.clear()
+        ws_pos.update(pos_rows, value_input_option="RAW")
+        print(f"✅ posicoes_snapshot sincronizado: {len(pos_rows)-1} tickers")
+
+        cols_base = ["ticker", "quantidade", "preco_medio"]
+        df_pos = pd.DataFrame(pos_rows[1:], columns=cols_base)
 
         df_snapshot = atualizar_snapshot_carteira(
             df_pos,
@@ -1185,9 +1209,7 @@ def atualizar_snapshot_posicoes(sh):
             if v is None or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
                 return ""
             if isinstance(v, float):
-                # Gravar como string com ponto decimal explícito.
-                # float(v) com RAW ainda sofre influência do locale pt-BR no Sheets.
-                return str(v)
+                return str(v)  # string com ponto decimal explícito — evita locale pt-BR
             if isinstance(v, int):
                 return v
             return v
