@@ -188,14 +188,22 @@ def atualizar_snapshot_carteira(
 
         df_t["_mes"] = df_t["_dt"].dt.to_period("M")
 
-        serie = [
-            float(v)
-            for v in df_t.groupby("_mes")["_vpc_v"]
-            .mean()
+        # CORRIGIDO: soma todos os proventos do mês (Dividendo + Rendimento + Aluguel)
+        # .mean() causava distorção — ex: BBSE3 com aluguel R$0.04 no mês dava trend -28%
+        serie_raw = (
+            df_t.groupby("_mes")["_vpc_v"]
+            .sum()
             .sort_index()
-            .tolist()
-            if v > 0
-        ]
+        )
+
+        # Filtrar meses com valor muito pequeno (< 10% da mediana) — são fragmentos de aluguel/rendimento
+        # que chegam no começo ou fim do mês e distorcem a tendência
+        vals = [float(v) for v in serie_raw.tolist() if v > 0]
+        if len(vals) >= 4:
+            mediana = float(np.median(vals))
+            serie = [v for v in vals if v >= mediana * 0.10]
+        else:
+            serie = vals
 
         if len(serie) < 2:
             return "Sem dados", 0.0
