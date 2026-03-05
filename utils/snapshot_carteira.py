@@ -91,8 +91,53 @@ def atualizar_snapshot_carteira(
         (df["preco_atual"] - df["preco_medio"]) / df["preco_medio"]
     ).where(df["preco_medio"] > 0, np.nan)
 
-    # ── Placeholders ─────────────────────────────────────────────────────────
-    df["tendencia_6m"] = np.nan
+    # ── Tendência 6M dos proventos (valor_por_cota mensal) ───────────────────
+    # Reutiliza a lógica do card_decisao_renda.py:
+    # compara média dos últimos meses de valor_por_cota para detectar tendência.
+    # Resultado: label qualitativo + % numérico — para a IA consumir sem calcular.
+    def _tendencia_proventos(ticker: str):
+        df_t = df_prov[df_prov["ticker"] == ticker].copy()
+        if df_t.empty:
+            return "Sem dados", 0.0
+        _col = "data_pagamento" if "data_pagamento" in df_t.columns else "data"
+        df_t["_dt"] = pd.to_datetime(df_t[_col].replace("", np.nan), errors="coerce")
+        df_t = df_t.dropna(subset=["_dt"])
+        col_vpc = next((c for c in ["valor_por_cota", "vpc", "valor_cota"] if c in df_t.columns), None)
+        if col_vpc is None:
+            if "valor" in df_t.columns and "quantidade_na_data" in df_t.columns:
+                df_t["_vpc"] = df_t.apply(
+                    lambda r: (pd.to_numeric(r["valor"], errors="coerce") or 0)
+                              / max(pd.to_numeric(r["quantidade_na_data"], errors="coerce") or 1, 1),
+                    axis=1
+                )
+                col_vpc = "_vpc"
+            else:
+                return "Sem dados", 0.0
+        df_t["_vpc_v"] = pd.to_numeric(df_t[col_vpc], errors="coerce").fillna(0)
+        df_t["_mes"] = df_t["_dt"].dt.to_period("M")
+        serie = [float(v) for v in df_t.groupby("_mes")["_vpc_v"].mean().sort_index().tolist() if v > 0]
+        if len(serie) < 2:
+            return "Sem dados", 0.0
+        arr = np.array(serie)
+        if len(arr) >= 12:
+            m6_rec, m6_ant = arr[-6:].mean(), arr[-12:-6].mean()
+        elif len(arr) >= 6:
+            m6_rec = arr[-3:].mean() if len(arr) >= 3 else arr.mean()
+            m6_ant = arr[:3].mean() if len(arr) >= 3 else arr.mean()
+        else:
+            m6_rec, m6_ant = arr[-1], arr[0]
+        trend6 = float((m6_rec / m6_ant - 1) * 100) if m6_ant > 0 else 0.0
+        label = (
+            "Crescente" if trend6 > 3.0
+            else "Estável" if trend6 >= -3.0
+            else "Leve queda" if trend6 > -8.0
+            else "Queda relevante"
+        )
+        return label, round(trend6, 2)
+
+    tend_results = [_tendencia_proventos(t) for t in df["ticker"]]
+    df["tendencia_6m"] = [r[0] for r in tend_results]
+    df["trend6_pct"]   = [r[1] for r in tend_results]
 
     # ── Timestamp ─────────────────────────────────────────────────────────────
     df["atualizado_em"] = datetime.now().strftime("%Y-%m-%d %H:%M")
