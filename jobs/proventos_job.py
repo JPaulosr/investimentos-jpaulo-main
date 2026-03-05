@@ -1068,18 +1068,29 @@ def run() -> None:
 # SNAPSHOT CARTEIRA (executado após o robô)
 # =============================================================================
 def atualizar_snapshot_posicoes(sh):
+    """
+    Lê posicoes_snapshot (fonte imutável: ticker, quantidade, preco_medio)
+    e grava o resultado calculado em carteira_snapshot (aba separada).
+    Nunca sobrescreve posicoes_snapshot para evitar corrupção em cascata.
+    """
+    import math
+
     try:
-        ws_pos = sh.worksheet("posicoes_snapshot")
-        ws_cot = sh.worksheet("cotacoes_cache")
-        ws_prov = sh.worksheet("proventos")
-        ws_anun = sh.worksheet("proventos_anunciados")
+        ws_pos    = sh.worksheet("posicoes_snapshot")
+        ws_cot    = sh.worksheet("cotacoes_cache")
+        ws_prov   = sh.worksheet("proventos")
+        ws_anun   = sh.worksheet("proventos_anunciados")
         ws_master = sh.worksheet("ativos_master")
 
-        df_pos = pd.DataFrame(ws_pos.get_all_records())
-        df_cot = pd.DataFrame(ws_cot.get_all_records())
-        df_prov = pd.DataFrame(ws_prov.get_all_records())
-        df_anun = pd.DataFrame(ws_anun.get_all_records())
+        df_pos    = pd.DataFrame(ws_pos.get_all_records())
+        df_cot    = pd.DataFrame(ws_cot.get_all_records())
+        df_prov   = pd.DataFrame(ws_prov.get_all_records())
+        df_anun   = pd.DataFrame(ws_anun.get_all_records())
         df_master = pd.DataFrame(ws_master.get_all_records())
+
+        # Garantir que posicoes_snapshot só tem as colunas base antes de calcular
+        cols_base = [c for c in ["ticker", "quantidade", "preco_medio"] if c in df_pos.columns]
+        df_pos = df_pos[cols_base].copy()
 
         df_snapshot = atualizar_snapshot_carteira(
             df_pos,
@@ -1089,28 +1100,30 @@ def atualizar_snapshot_posicoes(sh):
             df_master,
         )
 
-        import math
-
         def _serialize(v):
             if isinstance(v, pd.Timestamp):
                 return v.strftime("%Y-%m-%d %H:%M")
-            if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+            if v is None or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
                 return ""
-            if v is None:
-                return ""
+            if isinstance(v, (int, float)):
+                return float(v)
             return v
 
         rows_out = [df_snapshot.columns.tolist()]
         for _, row in df_snapshot.iterrows():
             rows_out.append([_serialize(val) for val in row])
 
-        ws_pos.clear()
-        ws_pos.update(rows_out, value_input_option="USER_ENTERED")
+        # Gravar em aba separada — nunca toca em posicoes_snapshot
+        ws_cart = _ensure_ws(sh, "carteira_snapshot", rows=500, cols=25)
+        ws_cart.clear()
+        ws_cart.update(rows_out, value_input_option="RAW")
 
-        print(f"📊 Snapshot carteira atualizado: {len(rows_out)-1} linhas, {len(df_snapshot.columns)} colunas.")
+        print(f"📊 carteira_snapshot atualizado: {len(rows_out)-1} linhas, {len(df_snapshot.columns)} colunas.")
 
     except Exception as e:
+        import traceback
         print("❌ Erro ao atualizar snapshot carteira:", e)
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
