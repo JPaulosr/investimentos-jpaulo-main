@@ -13,8 +13,13 @@ from datetime import datetime
 
 
 def _to_num(series: pd.Series) -> pd.Series:
-    """Converte para numérico tolerando strings vazias (padrão do gspread)."""
-    return pd.to_numeric(series.replace("", np.nan), errors="coerce")
+    return (
+        series.astype(str)
+        .str.replace(".", "", regex=False)
+        .str.replace(",", ".", regex=False)
+        .replace("", np.nan)
+        .astype(float)
+    )
 
 
 def atualizar_snapshot_carteira(
