@@ -568,8 +568,70 @@ def run() -> None:
     gc = _get_client()
     sh = gc.open_by_key(SHEET_ID)
 
-    meta_map = build_meta_map_from_master(sh)
-    pos_map = build_pos_map_from_movimentacoes(sh)
+    # ── Batch read: lê 4 abas em 1 request para não estourar quota ──────────
+    import time as _time
+    _ABA_NAMES = {
+        "master": ABA_ATIVOS_MASTER,
+        "mov":    ABA_MOVIMENTACOES,
+        "anun":   ABA_ANUNCIADOS,
+        "logs":   ABA_LOGS,
+    }
+    _batch = sh.values_batch_get([f"'{v}'!A:Z" for v in _ABA_NAMES.values()])
+    _vr = _batch["valueRanges"]
+
+    def _vr_to_records(vr):
+        rows = vr.get("values", [])
+        if len(rows) < 2: return []
+        hdrs = [str(h).strip().lower() for h in rows[0]]
+        return [dict(zip(hdrs, r + [""] * (len(hdrs) - len(r)))) for r in rows[1:]]
+
+    _master_records = _vr_to_records(_vr[0])
+    _mov_records    = _vr_to_records(_vr[1])
+    _logs_vals_raw  = _vr[3]
+
+    def _build_meta(rows):
+        meta = {}
+        for r in rows:
+            tk = _norm_ticker(r.get("ticker") or r.get("ativo") or r.get("codigo") or "")
+            if not tk: continue
+            pvp = None
+            for pk in ["pvp","p_vp","p/vp","p_vp_atual","p_vpa","p/vpa"]:
+                raw = r.get(pk)
+                if raw and str(raw).strip():
+                    try: pvp = float(str(raw).replace(",",".").strip())
+                    except: pvp = None
+                    break
+            meta[tk] = {
+                "logo_url": str(r.get("logo_url") or r.get("logo") or "").strip(),
+                "classe": str(r.get("classe") or r.get("tipo_ativo") or "").strip(),
+                "subtipo": str(r.get("subtipo") or "").strip(),
+                "segmento": str(r.get("segmento") or "").strip(),
+                "classificacao_capital": str(r.get("classificacao_capital") or "").strip(),
+                "pvp": pvp,
+            }
+        return meta
+
+    def _build_pos(rows):
+        def _tof(v):
+            if v is None: return 0.0
+            if isinstance(v,(int,float)): return float(v)
+            st = re.sub(r"[^0-9,.\-]","",str(v).strip())
+            if "," in st and "." in st: st = st.replace(".","").replace(",",".")
+            else: st = st.replace(",",".")
+            try: return float(st)
+            except: return 0.0
+        pos = {}
+        for r in rows:
+            tk = _norm_ticker(r.get("ticker") or r.get("ativo") or r.get("codigo") or r.get("papel") or "")
+            if not tk: continue
+            qtd = _tof(r.get("quantidade") or r.get("qtd") or r.get("cotas") or 0)
+            tipo = r.get("tipo_operacao") or r.get("tipo") or r.get("operacao") or r.get("tipo_de_operacao")
+            if str(tipo or "").strip().upper() in {"VENDA","V","SELL","S"}: qtd *= -1.0
+            pos[tk] = pos.get(tk,0.0) + qtd
+        return {k: max(0.0,v) for k,v in pos.items()}
+
+    meta_map = _build_meta(_master_records)
+    pos_map  = _build_pos(_mov_records)
     print(f"🧩 meta_map={len(meta_map)} | pos_map={len(pos_map)} | aba_mov='{ABA_MOVIMENTACOES}'")
 
     ws_anun = _ensure_ws(sh, ABA_ANUNCIADOS, rows=8000, cols=30)
@@ -580,7 +642,7 @@ def run() -> None:
 
     _fix_misaligned_legacy_rows(ws_anun)
 
-    if not ws_logs.get_all_values():
+    if not _logs_vals_raw.get("values"):
         ws_logs.update("1:1", [["ts", "event_hash", "ticker", "tipo", "status"]])
 
     all_vals = ws_anun.get_all_values()
@@ -602,7 +664,7 @@ def run() -> None:
         existing_version_hash[eid] = str(row[idx_version - 1]).strip() if (idx_version - 1) < len(row) else ""
         existing_ativo[eid] = str(row[idx_ativo - 1]).strip() if (idx_ativo - 1) < len(row) else ""
 
-    logs_records = _safe_get_records(ws_logs)
+    logs_records = _vr_to_records(_logs_vals_raw)
     hashes_enviados = {str(r.get("event_hash") or "").strip() for r in logs_records if r.get("event_hash")}
     print(f"🧱 Anti-spam: {len(hashes_enviados)} hashes no alerts_log")
 
@@ -674,7 +736,13 @@ def run() -> None:
             hashes_enviados.add(hday)
             print(f"📬 Alerta PAYDAY enviado: {len(agg_pre)} ativos | R$ {_fmt_money_br(sum(agg_pre.values()))}")
 
-    eventos = fetch_events_from_master(sh)
+    # Reaproveita batch — sem nova leitura do ativos_master
+    tickers_eventos = sorted(set(
+        _norm_ticker(r.get("ticker") or r.get("ativo") or "")
+        for r in _master_records
+        if _norm_ticker(r.get("ticker") or r.get("ativo") or "")
+    ))
+    eventos = [{"ticker": t} for t in tickers_eventos]
     if not eventos:
         print("ℹ️ Nenhum evento retornado pelo fetch. Continuando para soft-delete e alerta de pagamento.")
 
@@ -1076,6 +1144,7 @@ def atualizar_snapshot_posicoes(sh):
     import math
 
     try:
+        _time.sleep(5)  # anti-quota antes do bloco de leituras do snapshot
         ws_pos    = sh.worksheet("posicoes_snapshot")
         ws_cot    = sh.worksheet("cotacoes_cache")
         ws_prov   = sh.worksheet("proventos")
