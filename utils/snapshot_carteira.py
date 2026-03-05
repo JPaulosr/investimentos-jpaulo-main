@@ -39,8 +39,14 @@ def atualizar_snapshot_carteira(
     # DY 12M
     # =========================
     hoje = pd.Timestamp.today()
+
+    # A coluna de data na aba 'proventos' pode ser 'data' ou 'data_pagamento'
+    _col_data_prov = "data_pagamento" if "data_pagamento" in df_proventos.columns else "data"
+    df_proventos = df_proventos.copy()
+    df_proventos[_col_data_prov] = pd.to_datetime(df_proventos[_col_data_prov], errors="coerce")
+
     ultimos_12m = df_proventos[
-        df_proventos["data_pagamento"] >= hoje - pd.DateOffset(months=12)
+        df_proventos[_col_data_prov] >= hoje - pd.DateOffset(months=12)
     ]
 
     dy_map = (
