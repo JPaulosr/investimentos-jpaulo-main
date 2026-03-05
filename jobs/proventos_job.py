@@ -1089,12 +1089,25 @@ def atualizar_snapshot_posicoes(sh):
             df_master,
         )
 
-        ws_pos.clear()
-        ws_pos.update(
-            [df_snapshot.columns.tolist()] + df_snapshot.values.tolist()
-        )
+        import math
 
-        print("📊 Snapshot carteira atualizado com sucesso.")
+        def _serialize(v):
+            if isinstance(v, pd.Timestamp):
+                return v.strftime("%Y-%m-%d %H:%M")
+            if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+                return ""
+            if v is None:
+                return ""
+            return v
+
+        rows_out = [df_snapshot.columns.tolist()]
+        for _, row in df_snapshot.iterrows():
+            rows_out.append([_serialize(val) for val in row])
+
+        ws_pos.clear()
+        ws_pos.update(rows_out, value_input_option="USER_ENTERED")
+
+        print(f"📊 Snapshot carteira atualizado: {len(rows_out)-1} linhas, {len(df_snapshot.columns)} colunas.")
 
     except Exception as e:
         print("❌ Erro ao atualizar snapshot carteira:", e)
