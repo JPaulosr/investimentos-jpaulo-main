@@ -45,6 +45,9 @@ def atualizar_snapshot_carteira(
     # =========================
     df["valor_investido"] = df["quantidade"] * df["preco_medio"]
     df["valor_mercado"]   = df["quantidade"] * df["preco_atual"]
+    
+    df["valor_investido"] = _to_numeric_col(df["valor_investido"])
+    df["valor_mercado"]   = _to_numeric_col(df["valor_mercado"])
 
     total_mercado = df["valor_mercado"].sum()
     df["peso_pct"] = df["valor_mercado"] / total_mercado
