@@ -985,7 +985,7 @@ def run() -> None:
     if append_rows:
         CHUNK = 20
         for i in range(0, len(append_rows), CHUNK):
-            ws_anun.append_rows(append_rows[i:i + CHUNK], value_input_option="USER_ENTERED")
+            ws_anun.append_rows(append_rows[i:i + CHUNK], value_input_option="RAW")
 
     if cell_updates:
         ws_anun.batch_update(cell_updates)
@@ -993,7 +993,7 @@ def run() -> None:
     if log_rows:
         CHUNK = 50
         for i in range(0, len(log_rows), CHUNK):
-            ws_logs.append_rows(log_rows[i:i + CHUNK], value_input_option="USER_ENTERED")
+            ws_logs.append_rows(log_rows[i:i + CHUNK], value_input_option="RAW")
 
     # =============================================================================
     # RESUMO FINAL DO LOTE
