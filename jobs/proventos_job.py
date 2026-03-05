@@ -606,10 +606,77 @@ def run() -> None:
     hashes_enviados = {str(r.get("event_hash") or "").strip() for r in logs_records if r.get("event_hash")}
     print(f"🧱 Anti-spam: {len(hashes_enviados)} hashes no alerts_log")
 
+    # =============================================================================
+    # ✅ SOFT-DELETE PROATIVO: linhas com data_pagamento passada + ativo=1
+    # =============================================================================
+    hoje_iso = _today_sp_iso()
+    idx_dp_col = hmap.get("data_pagamento")
+    softdelete_updates: List[Dict[str, Any]] = []
+    if idx_dp_col:
+        for ridx in range(2, len(all_vals) + 1):
+            row = all_vals[ridx - 1]
+            ativo_val = str(row[idx_ativo - 1]).strip() if (idx_ativo - 1) < len(row) else ""
+            if ativo_val in ("0", "False", "false"):
+                continue
+            dp_raw = str(row[idx_dp_col - 1]).strip() if (idx_dp_col - 1) < len(row) else ""
+            dp = _norm_date(dp_raw)
+            if dp and dp < hoje_iso:
+                softdelete_updates.append({"range": _cell_a1(hmap["ativo"], ridx), "values": [[0]]})
+                eid_row = str(row[idx_event_id - 1]).strip() if (idx_event_id - 1) < len(row) else ""
+                if eid_row:
+                    existing_ativo[eid_row] = "0"
+        if softdelete_updates:
+            ws_anun.batch_update(softdelete_updates)
+            print(f"🗑️ Soft-delete proativo: {len(softdelete_updates)} linhas expiradas marcadas como ativo=0")
+
+    # =============================================================================
+    # ✅ ALERTA ANTECIPADO: HOJE TEM PAGAMENTO (varre planilha antes do fetch)
+    # Garante alerta mesmo que o fetch não retorne eventos novos
+    # =============================================================================
+    payday_pre: Dict[str, float] = {}
+    idx_status_col = hmap.get("status")
+    idx_vpc_col = hmap.get("valor_por_cota")
+    idx_tk_col = hmap.get("ticker")
+    if idx_status_col and idx_dp_col and idx_tk_col and idx_vpc_col:
+        for ridx in range(2, len(all_vals) + 1):
+            row = all_vals[ridx - 1]
+            ativo_val = str(row[idx_ativo - 1]).strip() if (idx_ativo - 1) < len(row) else ""
+            if ativo_val in ("0", "False", "false"):
+                continue
+            dp_raw = str(row[idx_dp_col - 1]).strip() if (idx_dp_col - 1) < len(row) else ""
+            dp = _norm_date(dp_raw)
+            if dp != hoje_iso:
+                continue
+            tk_row = _norm_ticker(row[idx_tk_col - 1]) if (idx_tk_col - 1) < len(row) else ""
+            if not tk_row:
+                continue
+            qtd = float(pos_map.get(tk_row, 0.0) or 0.0)
+            if qtd <= 0:
+                continue
+            vpc_raw = row[idx_vpc_col - 1] if (idx_vpc_col - 1) < len(row) else ""
+            vpc = _norm_float(vpc_raw)
+            if vpc and vpc > 0:
+                payday_pre[tk_row] = payday_pre.get(tk_row, 0.0) + float(qtd) * float(vpc)
+
+    if payday_pre:
+        agg_pre = dict(sorted(payday_pre.items(), key=lambda x: x[1], reverse=True))
+        hday = _sha1("PAYDAY|" + hoje_iso + "|" + ",".join(sorted(agg_pre.keys())))
+        if hday not in hashes_enviados:
+            linhas_pre = [f"• {_fmt_ddmm(hoje_iso)} — {tk}: R$ {_fmt_money_br(val)}" for tk, val in list(agg_pre.items())[:12]]
+            msg_pre = (
+                f"📬💰 HOJE TEM PAGAMENTO — {_fmt_date_br(hoje_iso)}\n\n"
+                f"Ativos pagando hoje: {len(agg_pre)}\n"
+                f"Estimativa (carteira): R$ {_fmt_money_br(float(sum(agg_pre.values())))}\n\n"
+                + "\n".join(linhas_pre)
+                + "\n\n📌 Ação: confira o extrato da corretora / lançamentos no app"
+            )
+            _send_telegram(msg_pre)
+            hashes_enviados.add(hday)
+            print(f"📬 Alerta PAYDAY enviado: {len(agg_pre)} ativos | R$ {_fmt_money_br(sum(agg_pre.values()))}")
+
     eventos = fetch_events_from_master(sh)
     if not eventos:
-        print("ℹ️ Nenhum evento retornado pelo fetch. Nada a fazer.")
-        return
+        print("ℹ️ Nenhum evento retornado pelo fetch. Continuando para soft-delete e alerta de pagamento.")
 
     inserted = 0
     updated = 0
@@ -623,7 +690,7 @@ def run() -> None:
     resumo_itens: List[Tuple[str, float, str]] = []
     resumo_total: float = 0.0
 
-    hoje_iso = _today_sp_iso()
+    # hoje_iso já foi definido acima (soft-delete)
     payday_itens: List[Tuple[str, float]] = []
     payday_total: float = 0.0
 
