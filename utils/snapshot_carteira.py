@@ -8,18 +8,27 @@ from datetime import datetime
 
 def _to_num(series: pd.Series) -> pd.Series:
     """
-    Converte valores numéricos vindos do Sheets
-    Aceita:
-    24.22
-    24,22
-    2.422,00
+    Converte para float tolerando formatos pt-BR e en-US:
+      24.22      → 24.22  (ponto decimal, já correto)
+      24,22      → 24.22  (vírgula decimal, pt-BR)
+      2.422,00   → 2422.0 (milhar com ponto + vírgula decimal, pt-BR)
+      2,422.00   → 2422.0 (milhar com vírgula + ponto decimal, en-US)
+    Regra: se tem vírgula → tratar como pt-BR; caso contrário não mexe.
     """
-    return pd.to_numeric(
-        series.astype(str)
-        .str.replace(".", "", regex=False)
-        .str.replace(",", ".", regex=False),
-        errors="coerce",
-    )
+    def _parse(v):
+        if isinstance(v, (int, float)):
+            return float(v)
+        s = str(v).strip()
+        if not s or s in ("", "nan", "None", "NaN"):
+            return float("nan")
+        if "," in s:
+            # pt-BR: remove pontos de milhar, troca vírgula por ponto
+            s = s.replace(".", "").replace(",", ".")
+        try:
+            return float(s)
+        except ValueError:
+            return float("nan")
+    return pd.to_numeric(series.apply(_parse), errors="coerce")
 
 
 def atualizar_snapshot_carteira(
@@ -163,14 +172,9 @@ def atualizar_snapshot_carteira(
 
                 df_t["_vpc"] = df_t.apply(
                     lambda r: (
-                        pd.to_numeric(r["valor"], errors="coerce") or 0
-                    )
-                    / max(
-                        pd.to_numeric(
-                            r["quantidade_na_data"], errors="coerce"
-                        )
-                        or 1,
-                        1,
+                        _to_num(pd.Series([r["valor"]])).iloc[0] or 0
+                    ) / max(
+                        _to_num(pd.Series([r["quantidade_na_data"]])).iloc[0] or 1, 1
                     ),
                     axis=1,
                 )
@@ -180,9 +184,7 @@ def atualizar_snapshot_carteira(
             else:
                 return "Sem dados", 0.0
 
-        df_t["_vpc_v"] = pd.to_numeric(
-            df_t[col_vpc], errors="coerce"
-        ).fillna(0)
+        df_t["_vpc_v"] = _to_num(df_t[col_vpc].astype(str)).fillna(0)
 
         df_t["_mes"] = df_t["_dt"].dt.to_period("M")
 
