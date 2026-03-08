@@ -83,7 +83,9 @@ HEADER_CONTRATO = [
     "tipo_pagamento",
     "data_com",
     "data_pagamento",
-    "valor_por_cota",
+    "valor_por_cota",        # valor líquido por cota (o que cai na conta)
+    "valor_bruto_por_cota",  # bruto antes do IR
+    "ir_por_cota",           # IR retido por cota
     "quantidade_ref",
     "fonte_url",
     "capturado_em",
@@ -91,7 +93,7 @@ HEADER_CONTRATO = [
     "ativo",
     "atualizado_em",
     "version_hash",
-    "pvp",  # ✅ NOVA COLUNA (no final para não deslocar nada)
+    "pvp",
 ]
 
 if not SHEET_ID:
@@ -316,14 +318,14 @@ def _cell_a1(col_idx: int, row_idx: int) -> str:
 def _assert_or_init_header(ws: gspread.Worksheet) -> List[str]:
     vals = ws.get_all_values()
     if not vals:
-        ws.update("1:1", [HEADER_CONTRATO])
+        ws.update([HEADER_CONTRATO], "1:1")
         return HEADER_CONTRATO
 
     cur = _normalize(vals[0])
     exp = _normalize(HEADER_CONTRATO)
 
     if cur != exp:
-        ws.update("1:1", [HEADER_CONTRATO])
+        ws.update([HEADER_CONTRATO], "1:1")
     return HEADER_CONTRATO
 
 def _looks_like_legacy_row(a: str, b: str, c: str, d: str) -> bool:
@@ -503,7 +505,7 @@ def build_pos_map_from_movimentacoes(sh: gspread.Spreadsheet) -> Dict[str, float
 # =============================================================================
 # FETCH — lê tickers do ativos_master
 # =============================================================================
-def fetch_events_from_master(sh: gspread.Spreadsheet) -> List[Dict[str, Any]]:
+def fetch_events_from_master(sh: gspread.Spreadsheet, pos_map: Dict[str, float] = {}) -> List[Dict[str, Any]]:
     try:
         ws = sh.worksheet(ABA_ATIVOS_MASTER)
     except Exception:
@@ -549,6 +551,23 @@ def fetch_events_from_master(sh: gspread.Spreadsheet) -> List[Dict[str, Any]]:
                 rr["data_com"] = _norm_date(rr.get("data_com", ""))
                 rr["data_pagamento"] = _norm_date(rr.get("data_pagamento", ""))
                 rr["valor_por_cota"] = _norm_float(rr.get("valor_por_cota", None))
+                # Bruto e IR — já calculados pelo proventos_fetch.py (15% para JCP/REND_TRIB, 0% para FII)
+                # Só recalcula se o site retornou totais reais (bruto_total + liq_total) — mais preciso que os 15%
+                _qtd_ref     = _norm_float(rr.get("quantidade_ref") or pos_map.get(_norm_ticker(rr.get("ticker", "")), None))
+                _bruto_total = _norm_float(rr.get("valor_bruto_total"))
+                _ir_total    = _norm_float(rr.get("ir_total"))
+                _liq_total   = _norm_float(rr.get("valor_liq_total"))
+
+                if _qtd_ref and _qtd_ref > 0 and _bruto_total and _liq_total:
+                    # Site retornou totais reais → divide para obter por cota (mais preciso)
+                    rr["valor_bruto_por_cota"] = round(_bruto_total / _qtd_ref, 8)
+                    rr["valor_por_cota"]       = round(_liq_total   / _qtd_ref, 8)
+                    rr["ir_por_cota"]          = round((_ir_total or (_bruto_total - _liq_total)) / _qtd_ref, 8)
+                else:
+                    # Usa o que o fetch já calculou (15% automático)
+                    rr["valor_bruto_por_cota"] = _norm_float(rr.get("valor_bruto_por_cota"))
+                    rr["ir_por_cota"]          = _norm_float(rr.get("ir_por_cota"))
+                # Se bruto não informado mas temos vpc (líquido), mantém bruto = None (não inventa)
                 rr["quantidade_ref"] = rr.get("quantidade_ref", "")
                 rr["fonte_url"] = str(rr.get("fonte_url", "") or "").strip()
                 rr["capturado_em"] = str(rr.get("capturado_em", "") or _now_iso_min())
@@ -563,6 +582,83 @@ def fetch_events_from_master(sh: gspread.Spreadsheet) -> List[Dict[str, Any]]:
     return eventos
 
 # =============================================================================
+# MIGRAÇÃO AUTOMÁTICA DE HEADER — aba proventos
+# =============================================================================
+HEADER_PROVENTOS = [
+    "id",
+    "portfolio_id",
+    "data",
+    "ticker",
+    "tipo",
+    "valor",                  # líquido (o que entrou na conta)
+    "quantidade_na_data",
+    "valor_por_cota",         # vpc líquido
+    "valor_bruto",            # bruto antes do IR (novo)
+    "ir_retido",              # IR retido total (novo)
+    "valor_bruto_por_cota",   # vpc bruto (novo)
+    "ir_por_cota",            # IR por cota (novo)
+    "origem",
+    "criado_em",
+]
+
+def ensure_proventos_tab(sh: gspread.Spreadsheet) -> None:
+    """
+    Garante que a aba 'proventos' tem todas as colunas do HEADER_PROVENTOS.
+    - Se a aba não existir: cria com o header completo.
+    - Se já existir mas faltar colunas: adiciona apenas as colunas novas
+      ao final do header existente (sem deslocar dados).
+    Idempotente: pode ser chamado toda vez que o robô rodar.
+    """
+    aba = ABA_MOVIMENTACOES.replace("movimentacoes", "proventos") if "movimentacoes" in ABA_MOVIMENTACOES else "proventos"
+    # tenta pegar a aba de proventos pelo env ou usa "proventos"
+    aba_prov = (
+        os.getenv("ABA_PROVENTOS_NOVO")
+        or os.getenv("ABA_PROVENTOS")
+        or "proventos"
+    ).strip()
+
+    try:
+        try:
+            ws = sh.worksheet(aba_prov)
+        except Exception:
+            ws = sh.add_worksheet(title=aba_prov, rows=5000, cols=30)
+            ws.update([HEADER_PROVENTOS], "1:1")
+            print(f"✅ Aba '{aba_prov}' criada com header completo.")
+            return
+
+        # Lê header atual
+        cur_header = ws.row_values(1)
+        cur_header_norm = [str(h).strip().lower() for h in cur_header]
+
+        # Descobre quais colunas faltam
+        missing = [c for c in HEADER_PROVENTOS if c.lower() not in cur_header_norm]
+
+        if not missing:
+            print(f"✅ Header da aba '{aba_prov}' já está completo ({len(cur_header)} colunas).")
+            return
+
+        # Adiciona colunas faltantes ao final do header
+        next_col = len(cur_header) + 1
+        updates = []
+        for i, col_name in enumerate(missing):
+            col_letter = chr(ord("A") + next_col - 1 + i) if (next_col - 1 + i) < 26 else None
+            if col_letter:
+                updates.append({"range": f"{col_letter}1", "values": [[col_name]]})
+
+        if updates:
+            ws.batch_update(updates)
+            print(f"✅ Aba '{aba_prov}': {len(missing)} colunas adicionadas → {missing}")
+        else:
+            print(f"⚠️ Aba '{aba_prov}': colunas faltantes mas não foi possível calcular posição (>26 colunas).")
+            # Fallback: reescreve header linha 1 preservando colunas existentes
+            novo_header = cur_header + missing
+            ws.update([novo_header], "1:1")
+            print(f"✅ Aba '{aba_prov}': header reescrito com {len(novo_header)} colunas.")
+
+    except Exception as e:
+        print(f"⚠️ ensure_proventos_tab falhou (não crítico): {e}")
+
+# =============================================================================
 # Engine
 # =============================================================================
 def run() -> None:
@@ -571,6 +667,9 @@ def run() -> None:
 
     gc = _get_client()
     sh = gc.open_by_key(SHEET_ID)
+
+    # Garante colunas novas na aba proventos (migração automática, idempotente)
+    ensure_proventos_tab(sh)
 
     # ── Batch read: lê 4 abas em 1 request para não estourar quota ──────────
     _ABA_NAMES = {
@@ -604,11 +703,20 @@ def run() -> None:
                     try: pvp = float(str(raw).replace(",",".").strip())
                     except: pvp = None
                     break
+            _classe   = str(r.get("classe")   or r.get("tipo_ativo") or "").strip()
+            _subtipo  = str(r.get("subtipo")  or "").strip()
+            _segmento = str(r.get("segmento") or "").strip()
+            _parts = []
+            for _p in [_classe, _subtipo, _segmento]:
+                if _p and _p.lower() not in [_x.lower() for _x in _parts]:
+                    _parts.append(_p)
+            _tipo_ativo = " / ".join(_parts).strip() or _classe
             meta[tk] = {
                 "logo_url": str(r.get("logo_url") or r.get("logo") or "").strip(),
-                "classe": str(r.get("classe") or r.get("tipo_ativo") or "").strip(),
-                "subtipo": str(r.get("subtipo") or "").strip(),
-                "segmento": str(r.get("segmento") or "").strip(),
+                "tipo_ativo": _tipo_ativo,                                          # ✅ FIX 1
+                "classe": _classe,
+                "subtipo": _subtipo,
+                "segmento": _segmento,
                 "classificacao_capital": str(r.get("classificacao_capital") or "").strip(),
                 "pvp": pvp,
             }
@@ -636,6 +744,9 @@ def run() -> None:
     meta_map = _build_meta(_master_records)
     pos_map  = _build_pos(_mov_records)
     print(f"🧩 meta_map={len(meta_map)} | pos_map={len(pos_map)} | aba_mov='{ABA_MOVIMENTACOES}'")
+
+    # 🔧 Corrige linhas existentes com campos vazios (idempotente)
+    repair_empty_fields(sh, meta_map, pos_map)
 
     ws_anun = _ensure_ws(sh, ABA_ANUNCIADOS, rows=8000, cols=30)
     ws_logs = _ensure_ws(sh, ABA_LOGS, rows=8000, cols=10)
@@ -739,13 +850,8 @@ def run() -> None:
             hashes_enviados.add(hday)
             print(f"📬 Alerta PAYDAY enviado: {len(agg_pre)} ativos | R$ {_fmt_money_br(sum(agg_pre.values()))}")
 
-    # Reaproveita batch — sem nova leitura do ativos_master
-    tickers_eventos = sorted(set(
-        _norm_ticker(r.get("ticker") or r.get("ativo") or "")
-        for r in _master_records
-        if _norm_ticker(r.get("ticker") or r.get("ativo") or "")
-    ))
-    eventos = [{"ticker": t} for t in tickers_eventos]
+    # Busca real dos eventos anunciados a partir do scraper
+    eventos = fetch_events_from_master(sh, pos_map)
     if not eventos:
         print("ℹ️ Nenhum evento retornado pelo fetch. Continuando para soft-delete e alerta de pagamento.")
 
@@ -807,6 +913,8 @@ def run() -> None:
         setc("data_com", row_norm.get("data_com"))
         setc("data_pagamento", row_norm.get("data_pagamento"))
         setc("valor_por_cota", row_norm.get("valor_por_cota"))
+        setc("valor_bruto_por_cota", row_norm.get("valor_bruto_por_cota"))  # ✅ fix bruto
+        setc("ir_por_cota", row_norm.get("ir_por_cota"))                    # ✅ fix ir
         setc("quantidade_ref", row_norm.get("quantidade_ref"))
         setc("fonte_url", row_norm.get("fonte_url"))
         setc("capturado_em", row_norm.get("capturado_em"))
@@ -829,6 +937,8 @@ def run() -> None:
             "data_com": _norm_date(ev.get("data_com", "")),
             "data_pagamento": _norm_date(ev.get("data_pagamento", "")),
             "valor_por_cota": _norm_float(ev.get("valor_por_cota", None)),
+            "valor_bruto_por_cota": _norm_float(ev.get("valor_bruto_por_cota", None) or ev.get("valor_bruto", None)),  # ✅ fix bruto
+            "ir_por_cota": _norm_float(ev.get("ir_por_cota", None) or ev.get("ir_retido_por_cota", None)),              # ✅ fix ir
             "quantidade_ref": ev.get("quantidade_ref", ""),
             "fonte_url": str(ev.get("fonte_url", "") or "").strip(),
             "capturado_em": str(ev.get("capturado_em", "") or _now_iso_min()),
@@ -855,6 +965,29 @@ def run() -> None:
                 "pvp": None,
             },
         )
+
+        # ✅ FIX 2: garante tipo_ativo e status nunca vazios
+        # tipo_ativo: fetch > ativos_master > fallback por tipo_pagamento
+        if not row_norm.get("tipo_ativo"):
+            _ta = str(meta.get("tipo_ativo") or meta.get("classe") or "").strip()
+            if not _ta:
+                # fallback inteligente por tipo_pagamento
+                _tp = row_norm.get("tipo_pagamento", "")
+                if _tp in ("RENDIMENTO",):
+                    _ta = "FII"
+                elif _tp in ("JCP", "DIVIDENDO"):
+                    _ta = "Ação"
+            row_norm["tipo_ativo"] = _ta
+
+        # status: sempre ANUNCIADO se vazio
+        if not row_norm.get("status"):
+            row_norm["status"] = "ANUNCIADO"
+
+        # quantidade_ref: preenche do pos_map se vazio
+        if not row_norm.get("quantidade_ref"):
+            _qtd_ref = pos_map.get(row_norm["ticker"], 0.0)
+            if _qtd_ref and _qtd_ref > 0:
+                row_norm["quantidade_ref"] = _qtd_ref
 
         qtd = float(pos_map.get(row_norm["ticker"], 0.0) or 0.0)
         posicao = {"qtd": qtd} if qtd > 0 else None
@@ -932,6 +1065,7 @@ def run() -> None:
 
         valor = row_norm["valor_por_cota"]
         updates: List[Tuple[str, Any]] = [
+            ("tipo_ativo", row_norm.get("tipo_ativo", "")),                         # ✅ FIX 3
             ("status", row_norm["status"]),
             ("data_pagamento", row_norm["data_pagamento"]),
             ("valor_por_cota", "" if valor is None else valor),
@@ -1138,7 +1272,7 @@ def run() -> None:
 # =============================================================================
 # SNAPSHOT CARTEIRA (executado após o robô)
 # =============================================================================
-def atualizar_snapshot_posicoes(sh, pos_map):
+def atualizar_snapshot_posicoes(sh, pos_map: dict):
     """
     Lê posicoes_snapshot (fonte imutável: ticker, quantidade, preco_medio)
     e grava o resultado calculado em carteira_snapshot (aba separada).
@@ -1230,6 +1364,107 @@ def atualizar_snapshot_posicoes(sh, pos_map):
         print("❌ Erro ao atualizar snapshot carteira:", e)
         traceback.print_exc()
 
+
+
+# =============================================================================
+# 🔧 REPAIR: corrige linhas existentes com tipo_ativo / status / quantidade_ref vazios
+# Chamado automaticamente no início de run() — idempotente
+# =============================================================================
+def repair_empty_fields(sh: gspread.Spreadsheet, meta_map: Dict[str, Any], pos_map: Dict[str, float]) -> None:
+    """
+    Varre a aba proventos_anunciados e preenche campos vazios nas linhas existentes:
+    - tipo_ativo  : vindo do ativos_master (meta_map)
+    - status      : força ANUNCIADO se vazio
+    - quantidade_ref : vindo do pos_map
+    Não altera version_hash (não dispara re-notificação).
+    """
+    try:
+        ws = sh.worksheet(ABA_ANUNCIADOS)
+        all_vals = ws.get_all_values()
+        if len(all_vals) < 2:
+            return
+
+        header = [str(h).strip().lower() for h in all_vals[0]]
+        hmap   = _col_idx_map(all_vals[0])
+
+        idx_ticker  = hmap.get("ticker")
+        idx_ta      = hmap.get("tipo_ativo")
+        idx_status  = hmap.get("status")
+        idx_qtd     = hmap.get("quantidade_ref")
+        idx_ativo   = hmap.get("ativo")
+
+        if not idx_ticker:
+            print("⚠️ repair: coluna 'ticker' não encontrada, pulando.")
+            return
+
+        updates = []
+        fixed = 0
+
+        for ridx in range(2, len(all_vals) + 1):
+            row = all_vals[ridx - 1]
+
+            def _cell(idx):
+                return str(row[idx - 1]).strip() if idx and (idx - 1) < len(row) else ""
+
+            tk = _norm_ticker(_cell(idx_ticker))
+            if not tk:
+                continue
+
+            # Não toca em linhas soft-deletadas
+            ativo_val = _cell(idx_ativo)
+            if ativo_val in ("0", "False", "false"):
+                continue
+
+            row_fixed = False
+
+            # ── tipo_ativo ──
+            if idx_ta:
+                cur_ta = _cell(idx_ta)
+                if not cur_ta:
+                    meta  = meta_map.get(tk, {})
+                    new_ta = str(meta.get("tipo_ativo") or meta.get("classe") or "").strip()
+                    if not new_ta:
+                        # fallback por tipo_pagamento
+                        idx_tp = hmap.get("tipo_pagamento")
+                        tp = _cell(idx_tp) if idx_tp else ""
+                        if tp in ("RENDIMENTO",):
+                            new_ta = "FII"
+                        elif tp in ("JCP", "DIVIDENDO"):
+                            new_ta = "Ação"
+                    if new_ta:
+                        updates.append({"range": _cell_a1(idx_ta, ridx), "values": [[new_ta]]})
+                        row_fixed = True
+
+            # ── status ──
+            if idx_status:
+                cur_st = _cell(idx_status)
+                if not cur_st:
+                    updates.append({"range": _cell_a1(idx_status, ridx), "values": [["ANUNCIADO"]]})
+                    row_fixed = True
+
+            # ── quantidade_ref ──
+            if idx_qtd:
+                cur_qtd = _cell(idx_qtd)
+                if not cur_qtd:
+                    qtd_ref = pos_map.get(tk, 0.0)
+                    if qtd_ref and qtd_ref > 0:
+                        updates.append({"range": _cell_a1(idx_qtd, ridx), "values": [[qtd_ref]]})
+                        row_fixed = True
+
+            if row_fixed:
+                fixed += 1
+
+        if updates:
+            # batch em blocos de 100 para não estourar limite
+            CHUNK = 100
+            for i in range(0, len(updates), CHUNK):
+                ws.batch_update(updates[i:i+CHUNK])
+            print(f"🔧 repair_empty_fields: {fixed} linhas corrigidas ({len(updates)} células atualizadas)")
+        else:
+            print("✅ repair_empty_fields: nenhum campo vazio encontrado")
+
+    except Exception as e:
+        print(f"⚠️ repair_empty_fields falhou (não crítico): {e}")
 
 if __name__ == "__main__":
     run()
