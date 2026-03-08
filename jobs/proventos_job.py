@@ -1272,7 +1272,113 @@ def run() -> None:
     print("🔄 Atualizando snapshot carteira...")
     atualizar_snapshot_posicoes(sh, pos_map)
 
+    # =============================================================================
+    # 📌 SYNC P/VP → ativos_master (persiste pvp independente de proventos anunciados)
+    # =============================================================================
+    print("📌 Sincronizando P/VP no ativos_master...")
+    sync_pvp_to_ativos_master(sh, meta_map, pos_map)
+
     print("🏁 Concluído.")
+
+
+# =============================================================================
+# 📌 SYNC P/VP → ativos_master (persistente, não depende de proventos anunciados)
+# =============================================================================
+def sync_pvp_to_ativos_master(sh: gspread.Spreadsheet, meta_map: Dict[str, Any], pos_map: Dict[str, float]) -> None:
+    """
+    Garante que a coluna 'pvp' existe na aba ativos_master e atualiza o valor
+    para cada ticker com posição ativa.
+
+    Fluxo:
+    1. Lê o header do ativos_master — adiciona coluna 'pvp' se não existir
+    2. Para cada ticker em pos_map (qtd > 0):
+       - Pega pvp do meta_map (já lido do master) ou busca no Investidor10
+       - Atualiza a célula correspondente se o valor mudou ou estava vazio
+    3. Batch update — 1 chamada de API
+    """
+    try:
+        ws = sh.worksheet(ABA_ATIVOS_MASTER)
+    except Exception as e:
+        print(f"⚠️ sync_pvp_to_ativos_master: aba '{ABA_ATIVOS_MASTER}' não encontrada: {e}")
+        return
+
+    try:
+        all_vals = ws.get_all_values()
+        if not all_vals:
+            print("⚠️ sync_pvp_to_ativos_master: aba vazia.")
+            return
+
+        header = [str(h).strip().lower() for h in all_vals[0]]
+
+        # Garante coluna pvp — adiciona no final se não existir
+        if "pvp" not in header:
+            new_col_idx = len(header) + 1          # 1-based
+            ws.update_cell(1, new_col_idx, "pvp")
+            # Recarrega com a nova coluna
+            all_vals = ws.get_all_values()
+            header = [str(h).strip().lower() for h in all_vals[0]]
+            print(f"✅ sync_pvp_to_ativos_master: coluna 'pvp' adicionada (col {new_col_idx})")
+
+        idx_ticker = next((i + 1 for i, h in enumerate(header) if h in ("ticker", "ativo", "codigo")), None)
+        idx_pvp    = next((i + 1 for i, h in enumerate(header) if h in ("pvp", "p_vp", "p/vp")), None)
+
+        if not idx_ticker or not idx_pvp:
+            print("⚠️ sync_pvp_to_ativos_master: colunas ticker/pvp não encontradas.")
+            return
+
+        # Cache pvp local para não repetir fetch no Investidor10 por ticker
+        pvp_fetch_cache: Dict[str, Optional[float]] = {}
+
+        def _get_pvp(tk: str) -> Optional[float]:
+            # 1) meta_map (já lido do master na rodada atual)
+            pv = meta_map.get(tk, {}).get("pvp") if isinstance(meta_map.get(tk), dict) else None
+            if pv is not None:
+                try:
+                    f = float(pv)
+                    if 0.0 < f < 50.0:
+                        return f
+                except Exception:
+                    pass
+            # 2) fallback: scrape investidor10
+            if tk not in pvp_fetch_cache:
+                pvp_fetch_cache[tk] = fetch_pvp_investidor10(tk)
+            return pvp_fetch_cache[tk]
+
+        updates = []
+        for ridx, row in enumerate(all_vals[1:], start=2):
+            tk = _norm_ticker(row[idx_ticker - 1]) if (idx_ticker - 1) < len(row) else ""
+            if not tk:
+                continue
+
+            # Só atualiza tickers com posição ativa
+            if float(pos_map.get(tk, 0.0) or 0.0) <= 0:
+                continue
+
+            cur = str(row[idx_pvp - 1]).strip() if (idx_pvp - 1) < len(row) else ""
+
+            pv = _get_pvp(tk)
+            if pv is None:
+                continue
+
+            # Atualiza se vazio ou diferente (arredonda 2 casas para comparar)
+            try:
+                if cur and abs(float(cur) - pv) < 0.001:
+                    continue   # sem mudança — pula
+            except Exception:
+                pass           # cur não é float → atualiza
+
+            updates.append({"range": _cell_a1(idx_pvp, ridx), "values": [[pv]]})
+
+        if updates:
+            ws.batch_update(updates)
+            print(f"✅ sync_pvp_to_ativos_master: {len(updates)} pvp(s) atualizados no master.")
+        else:
+            print("✅ sync_pvp_to_ativos_master: nenhuma atualização necessária.")
+
+    except Exception as e:
+        import traceback
+        print(f"❌ sync_pvp_to_ativos_master: erro — {e}")
+        traceback.print_exc()
 
 
 # =============================================================================
