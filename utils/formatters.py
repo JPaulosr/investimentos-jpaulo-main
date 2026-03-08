@@ -99,7 +99,9 @@ def build_provento_msg(
     vpc: float, estimativa_total: float,
     yoc: float, dy: float, preco_atual_ref: float,
     metodo: str, status_msg: str,
-    classe: str = "fii"
+    classe: str = "fii",
+    valor_bruto: float = 0.0,
+    ir_retido: float = 0.0,
 ) -> str:
     
     classe = str(classe).lower().strip()
@@ -113,14 +115,36 @@ def build_provento_msg(
         lbl_dy = "DY (na cotação atual)" if is_fii else "DY (anual)"
         linha_dy = f"📈 {lbl_dy}: <b>{fmt_pct(dy)} {periodo_lbl}</b> (Cotação: {fmt_brl(preco_atual_ref)})\n"
 
+    # Bloco de bruto + IR (só mostra se houver IR retido)
+    bloco_ir = ""
+    _bruto = float(valor_bruto or 0)
+    _ir = float(ir_retido or 0)
+    if _ir > 0 and _bruto > 0:
+        bloco_ir = (
+            f"────────────────────\n"
+            f"🧾 <b>Detalhamento Fiscal</b>\n"
+            f"📊 Valor bruto: <b>{fmt_brl(_bruto)}</b>\n"
+            f"🏛️ IR retido: <b>-{fmt_brl(_ir)}</b>\n"
+            f"✅ Valor líquido: <b>{fmt_brl(valor_total)}</b>\n"
+        )
+    elif _bruto > 0 and abs(_bruto - valor_total) > 0.01:
+        bloco_ir = (
+            f"────────────────────\n"
+            f"🧾 <b>Detalhamento Fiscal</b>\n"
+            f"📊 Valor bruto: <b>{fmt_brl(_bruto)}</b>\n"
+            f"🏛️ IR retido: <b>-{fmt_brl(_bruto - valor_total)}</b>\n"
+            f"✅ Valor líquido: <b>{fmt_brl(valor_total)}</b>\n"
+        )
+
     return (
         f"💰 <b>PROVENTO RECEBIDO (REAL)</b>\n"
         f"🕒 {data_ref}\n\n"
         f"🏷️ Ativo: <b>{ticker}</b>\n\n"
         f"📦 Base: <b>{float(qtd_total):g} cotas</b>\n"
-        f"💵 <b>Valor Creditado: {fmt_brl(valor_total)}</b>\n"
-        f"📊 {lbl_vpc}: <b>{fmt_brl(vpc)}</b>\n\n"
-        f"────────────────────\n"
+        f"💵 <b>Valor Líquido: {fmt_brl(valor_total)}</b>\n"
+        f"📊 {lbl_vpc} (líquido): <b>{fmt_brl(vpc)}</b>\n"
+        f"{bloco_ir}"
+        f"\n────────────────────\n"
         f"📍 <b>Status vs Último</b>\n"
         f"{status_msg}\n\n"
         f"📐 <b>Indicadores</b>\n"
