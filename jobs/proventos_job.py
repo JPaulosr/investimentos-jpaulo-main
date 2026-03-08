@@ -83,10 +83,11 @@ HEADER_CONTRATO = [
     "tipo_pagamento",
     "data_com",
     "data_pagamento",
-    "valor_por_cota",        # valor líquido por cota (o que cai na conta)
-    "valor_bruto_por_cota",  # bruto antes do IR
+    "valor_por_cota",        # BRUTO por cota (o que o site anuncia)
+    "valor_bruto_por_cota",  # BRUTO por cota (redundante, para compatibilidade)
+    "valor_liq_por_cota",    # líquido por cota (após IR)
     "ir_por_cota",           # IR retido por cota
-    "quantidade_ref",
+    "quantidade_ref",        # quantidade de cotas na carteira (do pos_map)
     "fonte_url",
     "capturado_em",
     "event_id",
@@ -550,25 +551,24 @@ def fetch_events_from_master(sh: gspread.Spreadsheet, pos_map: Dict[str, float] 
                 rr["tipo_pagamento"] = str(rr.get("tipo_pagamento", "") or "").strip().upper()
                 rr["data_com"] = _norm_date(rr.get("data_com", ""))
                 rr["data_pagamento"] = _norm_date(rr.get("data_pagamento", ""))
-                rr["valor_por_cota"] = _norm_float(rr.get("valor_por_cota", None))
-                # Bruto e IR — já calculados pelo proventos_fetch.py (15% para JCP/REND_TRIB, 0% para FII)
-                # Só recalcula se o site retornou totais reais (bruto_total + liq_total) — mais preciso que os 15%
-                _qtd_ref     = _norm_float(rr.get("quantidade_ref") or pos_map.get(_norm_ticker(rr.get("ticker", "")), None))
-                _bruto_total = _norm_float(rr.get("valor_bruto_total"))
-                _ir_total    = _norm_float(rr.get("ir_total"))
-                _liq_total   = _norm_float(rr.get("valor_liq_total"))
+                # ══════════════════════════════════════════════════════════════
+                # proventos_fetch.py já retorna os campos corretos:
+                #   valor_por_cota       = BRUTO por cota
+                #   valor_bruto_por_cota = BRUTO por cota (igual)
+                #   valor_liq_por_cota   = líquido por cota
+                #   ir_por_cota          = IR por cota (real do site ou 15% calculado)
+                #   quantidade_ref       = vazio (não vem do site público)
+                #
+                # quantidade_ref é preenchida abaixo via pos_map (fonte de verdade)
+                # ══════════════════════════════════════════════════════════════
+                rr["valor_por_cota"]      = _norm_float(rr.get("valor_por_cota"))       # bruto
+                rr["valor_bruto_por_cota"]= _norm_float(rr.get("valor_bruto_por_cota")) # bruto (igual)
+                rr["valor_liq_por_cota"]  = _norm_float(rr.get("valor_liq_por_cota"))   # líquido
+                rr["ir_por_cota"]         = _norm_float(rr.get("ir_por_cota"))           # IR/cota
 
-                if _qtd_ref and _qtd_ref > 0 and _bruto_total and _liq_total:
-                    # Site retornou totais reais → divide para obter por cota (mais preciso)
-                    rr["valor_bruto_por_cota"] = round(_bruto_total / _qtd_ref, 8)
-                    rr["valor_por_cota"]       = round(_liq_total   / _qtd_ref, 8)
-                    rr["ir_por_cota"]          = round((_ir_total or (_bruto_total - _liq_total)) / _qtd_ref, 8)
-                else:
-                    # Usa o que o fetch já calculou (15% automático)
-                    rr["valor_bruto_por_cota"] = _norm_float(rr.get("valor_bruto_por_cota"))
-                    rr["ir_por_cota"]          = _norm_float(rr.get("ir_por_cota"))
-                # Se bruto não informado mas temos vpc (líquido), mantém bruto = None (não inventa)
-                rr["quantidade_ref"] = rr.get("quantidade_ref", "")
+                # quantidade_ref: preenche do pos_map (carteira atual)
+                _qtd_pos = _norm_float(pos_map.get(_norm_ticker(rr.get("ticker", "")), None))
+                rr["quantidade_ref"] = _qtd_pos if _qtd_pos and _qtd_pos > 0 else ""
                 rr["fonte_url"] = str(rr.get("fonte_url", "") or "").strip()
                 rr["capturado_em"] = str(rr.get("capturado_em", "") or _now_iso_min())
 
@@ -916,10 +916,11 @@ def run() -> None:
         setc("tipo_pagamento", row_norm.get("tipo_pagamento"))
         setc("data_com", row_norm.get("data_com"))
         setc("data_pagamento", row_norm.get("data_pagamento"))
-        setc("valor_por_cota", row_norm.get("valor_por_cota"))
-        setc("valor_bruto_por_cota", row_norm.get("valor_bruto_por_cota"))  # ✅ fix bruto
-        setc("ir_por_cota", row_norm.get("ir_por_cota"))                    # ✅ fix ir
-        setc("quantidade_ref", row_norm.get("quantidade_ref"))
+        setc("valor_por_cota",       row_norm.get("valor_por_cota"))        # BRUTO
+        setc("valor_bruto_por_cota", row_norm.get("valor_bruto_por_cota"))  # BRUTO (compat)
+        setc("valor_liq_por_cota",   row_norm.get("valor_liq_por_cota"))    # LÍQUIDO
+        setc("ir_por_cota",          row_norm.get("ir_por_cota"))            # IR/cota
+        setc("quantidade_ref",       row_norm.get("quantidade_ref"))
         setc("fonte_url", row_norm.get("fonte_url"))
         setc("capturado_em", row_norm.get("capturado_em"))
         setc("event_id", row_norm.get("event_id"))
@@ -940,10 +941,11 @@ def run() -> None:
             "tipo_pagamento": str(ev.get("tipo_pagamento", "") or "").strip().upper(),
             "data_com": _norm_date(ev.get("data_com", "")),
             "data_pagamento": _norm_date(ev.get("data_pagamento", "")),
-            "valor_por_cota": _norm_float(ev.get("valor_por_cota", None)),
-            "valor_bruto_por_cota": _norm_float(ev.get("valor_bruto_por_cota", None) or ev.get("valor_bruto", None)),  # ✅ fix bruto
-            "ir_por_cota": _norm_float(ev.get("ir_por_cota", None) or ev.get("ir_retido_por_cota", None)),              # ✅ fix ir
-            "quantidade_ref": ev.get("quantidade_ref", ""),
+            "valor_por_cota":       _norm_float(ev.get("valor_por_cota")),                                      # BRUTO
+            "valor_bruto_por_cota": _norm_float(ev.get("valor_bruto_por_cota") or ev.get("valor_bruto")),     # BRUTO (compat)
+            "valor_liq_por_cota":   _norm_float(ev.get("valor_liq_por_cota") or ev.get("valor_liq")),         # LÍQUIDO
+            "ir_por_cota":          _norm_float(ev.get("ir_por_cota") or ev.get("ir_retido_por_cota")),        # IR/cota
+            "quantidade_ref":       ev.get("quantidade_ref", ""),
             "fonte_url": str(ev.get("fonte_url", "") or "").strip(),
             "capturado_em": str(ev.get("capturado_em", "") or _now_iso_min()),
         }
@@ -1306,17 +1308,12 @@ def atualizar_snapshot_posicoes(sh, pos_map: dict):
         df_master = _ws_to_df(ws_master)
 
         # ✅ FIX: UNFORMATTED_VALUE retorna células vazias como int 0 em vez de "".
-        # Normaliza colunas específicas de texto/data para evitar TypeError no sort_values.
-        def _sanitize_str_cols(df, cols):
-            for c in cols:
-                if c in df.columns:
-                    col = df[c]
-                    # se houver coluna duplicada, pega só a primeira
-                    if isinstance(col, pd.DataFrame):
-                        col = col.iloc[:, 0]
-                    df[c] = col.apply(lambda x: "" if (x == 0 or x == "0" or x is None) else str(x)).replace("nan", "")
-        _sanitize_str_cols(df_anun, ["capturado_em", "data_com", "data_pagamento", "atualizado_em"])
-        _sanitize_str_cols(df_prov, ["data", "data_pagamento", "criado_em"])
+        # Colunas de texto/data com tipos mistos (str + int) causam TypeError no sort_values.
+        # Força todas as colunas para string nas abas que têm colunas de data/texto.
+        for _df in [df_anun, df_prov]:
+            for _col in _df.columns:
+                if _df[_col].dtype == object or _df[_col].apply(lambda x: isinstance(x, (str, int))).any():
+                    _df[_col] = _df[_col].astype(str).replace("0", "").replace("nan", "")
 
         # ── Sincronizar posicoes_snapshot a partir das movimentacoes ─────────
         # pos_map já foi calculado no início do job (fonte de verdade).
@@ -1389,25 +1386,44 @@ def atualizar_snapshot_posicoes(sh, pos_map: dict):
 # =============================================================================
 def repair_empty_fields(sh: gspread.Spreadsheet, meta_map: Dict[str, Any], pos_map: Dict[str, float]) -> None:
     """
-    Varre a aba proventos_anunciados e preenche campos vazios nas linhas existentes:
-    - tipo_ativo  : vindo do ativos_master (meta_map)
-    - status      : força ANUNCIADO se vazio
-    - quantidade_ref : vindo do pos_map
+    Varre a aba proventos_anunciados e corrige campos nas linhas existentes:
+
+    Campos básicos (preenche se vazio):
+    - tipo_ativo     : vindo do ativos_master (meta_map)
+    - status         : força ANUNCIADO se vazio
+    - quantidade_ref : vindo do pos_map (carteira atual)
+
+    Correção de dados corrompidos pelo bug do scraper (FIX 2026-03-08):
+    O Investidor10 retorna os 3 valores por cota na ordem: liq | bruto | ir
+    O scraper antigo salvava: valor_por_cota=liq, quantidade_ref=bruto, pvp=ir
+    Agora detecta esse padrão e move os valores para as colunas corretas.
+
     Não altera version_hash (não dispara re-notificação).
     """
+    def _to_f(s: str) -> Optional[float]:
+        try:
+            return float(str(s).replace(",", ".")) if s else None
+        except Exception:
+            return None
+
     try:
         ws = sh.worksheet(ABA_ANUNCIADOS)
         all_vals = ws.get_all_values()
         if len(all_vals) < 2:
             return
 
-        header = [str(h).strip().lower() for h in all_vals[0]]
-        hmap   = _col_idx_map(all_vals[0])
+        hmap = _col_idx_map(all_vals[0])
 
         idx_ticker  = hmap.get("ticker")
         idx_ta      = hmap.get("tipo_ativo")
         idx_status  = hmap.get("status")
+        idx_tp      = hmap.get("tipo_pagamento")
+        idx_vpc     = hmap.get("valor_por_cota")
+        idx_vbc     = hmap.get("valor_bruto_por_cota")
+        idx_vlc     = hmap.get("valor_liq_por_cota")
+        idx_ir      = hmap.get("ir_por_cota")
         idx_qtd     = hmap.get("quantidade_ref")
+        idx_pvp     = hmap.get("pvp")
         idx_ativo   = hmap.get("ativo")
 
         if not idx_ticker:
@@ -1427,7 +1443,6 @@ def repair_empty_fields(sh: gspread.Spreadsheet, meta_map: Dict[str, Any], pos_m
             if not tk:
                 continue
 
-            # Não toca em linhas soft-deletadas
             ativo_val = _cell(idx_ativo)
             if ativo_val in ("0", "False", "false"):
                 continue
@@ -1438,41 +1453,77 @@ def repair_empty_fields(sh: gspread.Spreadsheet, meta_map: Dict[str, Any], pos_m
             if idx_ta:
                 cur_ta = _cell(idx_ta)
                 if not cur_ta:
-                    meta  = meta_map.get(tk, {})
+                    meta   = meta_map.get(tk, {})
                     new_ta = str(meta.get("tipo_ativo") or meta.get("classe") or "").strip()
                     if not new_ta:
-                        # fallback por tipo_pagamento
-                        idx_tp = hmap.get("tipo_pagamento")
-                        tp = _cell(idx_tp) if idx_tp else ""
-                        if tp in ("RENDIMENTO",):
+                        tp_val = _cell(idx_tp) if idx_tp else ""
+                        if tp_val in ("RENDIMENTO",):
                             new_ta = "FII"
-                        elif tp in ("JCP", "DIVIDENDO"):
+                        elif tp_val in ("JCP", "DIVIDENDO"):
                             new_ta = "Ação"
                     if new_ta:
                         updates.append({"range": _cell_a1(idx_ta, ridx), "values": [[new_ta]]})
                         row_fixed = True
 
             # ── status ──
-            if idx_status:
-                cur_st = _cell(idx_status)
-                if not cur_st:
-                    updates.append({"range": _cell_a1(idx_status, ridx), "values": [["ANUNCIADO"]]})
-                    row_fixed = True
+            if idx_status and not _cell(idx_status):
+                updates.append({"range": _cell_a1(idx_status, ridx), "values": [["ANUNCIADO"]]})
+                row_fixed = True
 
             # ── quantidade_ref ──
             if idx_qtd:
-                cur_qtd = _cell(idx_qtd)
-                if not cur_qtd:
-                    qtd_ref = pos_map.get(tk, 0.0)
-                    if qtd_ref and qtd_ref > 0:
-                        updates.append({"range": _cell_a1(idx_qtd, ridx), "values": [[qtd_ref]]})
+                cur_qtd_str = _cell(idx_qtd)
+                cur_qtd     = _to_f(cur_qtd_str)
+                tp_val      = _cell(idx_tp) if idx_tp else ""
+
+                # ══════════════════════════════════════════════════════════════
+                # DETECÇÃO DE DADOS CORROMPIDOS (bug do scraper antigo):
+                # Sintoma: quantidade_ref < 10 mas é um valor monetário fracionado
+                #          (ex: 0.070142 em vez de 210)
+                # O scraper antigo salvava: vpc=liq/cota, qtd_ref=bruto/cota, pvp=ir/cota
+                # Estratégia: se qtd < 10 e pos_map tem quantidade real → corrige todos os campos
+                # ══════════════════════════════════════════════════════════════
+                qtd_real = pos_map.get(tk, 0.0)
+                is_corrupted = (
+                    cur_qtd is not None
+                    and 0 < cur_qtd < 10
+                    and qtd_real >= 10
+                )
+
+                if is_corrupted and idx_vpc and idx_vbc and idx_ir and idx_pvp:
+                    # cur_qtd_str é na verdade o bruto/cota
+                    # _cell(idx_vpc) é na verdade o liq/cota
+                    # _cell(idx_pvp) é na verdade o ir/cota
+                    bruto_cota = cur_qtd               # estava em quantidade_ref
+                    liq_cota   = _to_f(_cell(idx_vpc)) # estava em valor_por_cota
+                    ir_cota    = _to_f(_cell(idx_pvp))  # estava em pvp
+
+                    if bruto_cota and liq_cota and bruto_cota > liq_cota:
+                        # Sanidade: bruto > liq, e ir = bruto - liq
+                        ir_recalc = round(bruto_cota - liq_cota, 8)
+                        updates.append({"range": _cell_a1(idx_vpc, ridx), "values": [[bruto_cota]]})  # vpc = bruto
+                        updates.append({"range": _cell_a1(idx_vbc, ridx), "values": [[bruto_cota]]})  # vbc = bruto
+                        if idx_vlc:
+                            updates.append({"range": _cell_a1(idx_vlc, ridx), "values": [[liq_cota]]})   # vlc = liq
+                        updates.append({"range": _cell_a1(idx_ir,  ridx), "values": [[ir_recalc]]})    # ir = diferença
+                        updates.append({"range": _cell_a1(idx_qtd, ridx), "values": [[qtd_real]]})     # qtd = real
+                        # Preserva pvp real buscando do meta_map (não o valor corrompido)
+                        pvp_real = _to_f(str(meta_map.get(tk, {}).get("pvp") or ""))
+                        if pvp_real:
+                            updates.append({"range": _cell_a1(idx_pvp, ridx), "values": [[pvp_real]]})
+                        print(f"  🔧 {tk}: corrigido dados corrompidos — vpc {liq_cota}→{bruto_cota}, qtd {cur_qtd}→{qtd_real}")
+                        row_fixed = True
+
+                elif not cur_qtd_str or cur_qtd == 0:
+                    # Quantidade simplesmente vazia — preenche do pos_map
+                    if qtd_real and qtd_real > 0:
+                        updates.append({"range": _cell_a1(idx_qtd, ridx), "values": [[qtd_real]]})
                         row_fixed = True
 
             if row_fixed:
                 fixed += 1
 
         if updates:
-            # batch em blocos de 100 para não estourar limite
             CHUNK = 100
             for i in range(0, len(updates), CHUNK):
                 ws.batch_update(updates[i:i+CHUNK])
