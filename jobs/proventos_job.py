@@ -572,7 +572,8 @@ def fetch_events_from_master(sh: gspread.Spreadsheet, pos_map: Dict[str, float] 
                 rr["fonte_url"] = str(rr.get("fonte_url", "") or "").strip()
                 rr["capturado_em"] = str(rr.get("capturado_em", "") or _now_iso_min())
 
-                if rr["ticker"] and rr["tipo_pagamento"] and rr["data_com"]:
+                # ✅ FIX 1: data_com pode ser vazia (Statusinvest nem sempre retorna) — não descartar o evento
+                if rr["ticker"] and rr["tipo_pagamento"] and rr["data_pagamento"]:
                     eventos.append(rr)
         except Exception:
             print(f"❌ erro no fetch de {t}:")
@@ -1303,6 +1304,14 @@ def atualizar_snapshot_posicoes(sh, pos_map: dict):
         df_prov   = _ws_to_df(ws_prov)
         df_anun   = _ws_to_df(ws_anun)
         df_master = _ws_to_df(ws_master)
+
+        # ✅ FIX: UNFORMATTED_VALUE retorna células vazias como int 0 em vez de "".
+        # Colunas de texto/data com tipos mistos (str + int) causam TypeError no sort_values.
+        # Força todas as colunas para string nas abas que têm colunas de data/texto.
+        for _df in [df_anun, df_prov]:
+            for _col in _df.columns:
+                if _df[_col].dtype == object or _df[_col].apply(lambda x: isinstance(x, (str, int))).any():
+                    _df[_col] = _df[_col].astype(str).replace("0", "").replace("nan", "")
 
         # ── Sincronizar posicoes_snapshot a partir das movimentacoes ─────────
         # pos_map já foi calculado no início do job (fonte de verdade).
