@@ -681,15 +681,14 @@ Dados do ativo:
 {json.dumps(payload, ensure_ascii=False, indent=2)}"""
 
     import urllib.request, urllib.error, time
-    _t0, _budget = time.monotonic(), 60.0  # Aumentei o orçamento de tempo global
+    _t0, _budget = time.monotonic(), 90.0
 
     def _call(model_id: str) -> str:
         if (time.monotonic() - _t0) > _budget: raise TimeoutError('timeout')
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={api_key}"
-        body = json.dumps({"contents": [{"role": "user", "parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.4, "maxOutputTokens": 2048}}).encode("utf-8")
+        body = json.dumps({"contents": [{"role": "user", "parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.4, "maxOutputTokens": 3000}}).encode("utf-8")
         req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
-        # Aumentei o timeout de 15 para 30 segundos para a IA não ser cortada no meio da frase
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=45) as resp:
             return json.loads(resp.read().decode("utf-8")).get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
 
     modelos_para_testar = [
@@ -701,14 +700,25 @@ Dados do ativo:
         "gemini-1.5-pro",
     ]
     modelos_para_testar = [m for m in modelos_para_testar if m]
-    
+
     for mod in modelos_para_testar:
         try:
             print(f"🤖 IA: Tentando conectar com o modelo {mod}...")
             text = _call(mod)
-            if text: 
-                print(f"✅ IA Sucesso! Modelo usado: {mod}")
-                return text
+            if not text:
+                continue
+            # Se texto veio truncado, tenta 1x a mais com pequeno delay
+            if _looks_truncated(text):
+                print(f"⚠️ Texto truncado no modelo {mod}, tentando novamente...")
+                time.sleep(3)
+                text2 = _call(mod)
+                if text2 and not _looks_truncated(text2):
+                    text = text2
+                    print(f"✅ Retry resolveu o truncamento para {mod}")
+                else:
+                    print(f"⚠️ Retry não resolveu — fallback será usado pelo PDF")
+            print(f"✅ IA Sucesso! Modelo usado: {mod}")
+            return text
         except Exception as e:
             err_str = str(e)
             print(f"⚠️ Modelo {mod} falhou. Motivo: {err_str}")
@@ -718,6 +728,92 @@ Dados do ativo:
 
     print("❌ Todos os modelos da IA falharam. Verifique se a sua API Key do Google está ativa no AI Studio.")
     return ""
+# ─────────────────────────────────────────────
+# INSIDES IA — RELATÓRIO MENSAL DE PROVENTOS
+# ─────────────────────────────────────────────
+def build_relatorio_ia(
+    total_mes: float,
+    media_12m: float,
+    rank_mes,
+    total_12m: float,
+    top5_dict: list,          # lista de dicts: [{"ticker": ..., "total": ..., "pct": ...}]
+    pend_total: float,
+    proj_total: float,
+    mes_nome: str,
+    ano: int,
+    historico_meses: list,    # lista de dicts: [{"label": "Jan/2026", "total": 839.72, "yoy": +12.4}, ...]
+    api_key: str = "",
+    model: str = "gemini-2.5-flash",
+) -> str:
+    """Gera análise IA do relatório mensal de proventos. Retorna texto puro para inserir no PDF."""
+    if not api_key:
+        return ""
+
+    import json, urllib.request, urllib.error, time
+
+    diff = total_mes - media_12m
+    diff_pct = (diff / media_12m * 100.0) if media_12m > 0 else 0.0
+    status_vs_media = f"{'acima' if diff >= 0 else 'abaixo'} da média em R$ {abs(diff):.2f} ({abs(diff_pct):.1f}%)"
+
+    payload = {
+        "mes_referencia": f"{mes_nome}/{ano}",
+        "total_recebido_real": round(total_mes, 2),
+        "media_12m": round(media_12m, 2),
+        "status_vs_media": status_vs_media,
+        "rank_mes_12m": rank_mes,
+        "total_12m": round(total_12m, 2),
+        "total_pendente": round(pend_total, 2),
+        "projecao_total_mes": round(proj_total, 2),
+        "top5_pagadores": top5_dict,
+        "historico_recente": historico_meses[-6:] if len(historico_meses) >= 6 else historico_meses,
+    }
+
+    prompt = f"""Você é um mentor financeiro especialista em GERAÇÃO DE RENDA E APOSENTADORIA, conversando com um investidor de forma humana, didática e encorajadora.
+O sistema gerou o relatório mensal de proventos. Sua missão é fazer uma análise COMPLETA e DETALHADA, como um mentor experiente faria.
+NUNCA invente números além dos fornecidos. Use SOMENTE os dados do JSON abaixo. Escreva em português claro, sem economês.
+
+Escreva em texto corrido (sem markdown, sem asteriscos, sem travessões decorativos). Use APENAS estas seções em maiúsculas como títulos:
+
+ANALISE DO MES
+Escreva 3 a 4 frases completas explicando como foi o mês: valor recebido, comparação com a média dos 12 meses, o que o ranking significa na prática para o investidor. Seja específico com os números.
+
+DESTAQUES E PONTOS DE ATENCAO
+Escreva 3 a 4 frases completas sobre: quais ativos foram os maiores pagadores e qual percentual do mês representaram (concentração). Explique o risco de concentração se houver. Fale dos pendentes: quanto ainda vai entrar e como fica a projeção total do mês quando tudo chegar.
+
+TENDENCIA DA BOLA DE NEVE
+Escreva 3 a 4 frases completas analisando o histórico recente mês a mês. A renda está crescendo ou caindo? Há sazonalidade (meses que sempre pagam mais ou menos)? O investidor está no caminho certo considerando o crescimento anual?
+
+MENSAGEM FINAL
+Escreva 2 frases de encorajamento genuíno, focando na consistência da jornada de longo prazo e na importância de cada provento reinvestido.
+
+Dados do relatório:
+{json.dumps(payload, ensure_ascii=False, indent=2)}"""
+
+    def _call(model_id: str) -> str:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={api_key}"
+        body = json.dumps({
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.5, "maxOutputTokens": 2048}
+        }).encode("utf-8")
+        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            return json.loads(resp.read().decode("utf-8")).get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
+
+    modelos = [model, "gemini-2.5-flash", "gemini-2.0-flash-lite", "gemini-1.5-flash-8b"]
+    modelos = [m for m in modelos if m]
+    for mod in modelos:
+        try:
+            txt = _call(mod)
+            if txt:
+                print(f"✅ Relatório IA gerado com modelo {mod}")
+                return txt
+        except Exception as e:
+            print(f"⚠️ Modelo {mod} falhou no relatório IA: {e}")
+            if "429" in str(e):
+                time.sleep(10)
+    return ""
+
+
 # ─────────────────────────────────────────────
 # PDF SAFE TEXT (sanitização + fallback)
 # ─────────────────────────────────────────────
@@ -777,18 +873,51 @@ def _sanitize_ai_text_for_pdf(s: str) -> str:
 
 
 def _looks_truncated(s: str) -> bool:
-    """Heurística: detecta texto curto/incompleto (ex: termina em 'de', ':' etc)."""
+    """Detecta texto incompleto vindo da IA.
+
+    Casos tratados:
+    - Texto muito curto (< 200 chars)
+    - Última linha não termina com pontuação conclusiva (frase cortada no meio)
+    - Tem título de seção mas corpo muito curto (título sem conteúdo)
+    - Não tem seções reconhecíveis e texto pequeno
+    """
     if not s:
         return True
     ss = s.strip()
-    if len(ss) < 320:
+    if len(ss) < 200:
         return True
-    tail = ss[-60:].lower()
-    if tail.endswith((" de", " do", " da", " dos", " das", ":", "-", "=>", "->")):
+
+    # ── Última linha não termina com pontuação: frase cortada ──
+    last_line = ""
+    for line in reversed(ss.splitlines()):
+        if line.strip():
+            last_line = line.strip()
+            break
+    pontuacao_final = (".", "!", "?", "…", '"', "'", ")", "]", "—")
+    if last_line and not last_line.endswith(pontuacao_final):
+        is_titulo = last_line.isupper() and len(last_line) <= 80
+        if not is_titulo:
+            return True
+
+    ss_up = ss.upper()
+
+    # ── Tem título de seção mas corpo muito curto ──
+    # Ex: "TRADUÇÃO RÁPIDA\n" seguido de quase nada
+    has_section_title = any(k in ss_up for k in ("TRADU", "DEBULH", "RECADO", "AÇÃO PRÁTICA", "MENTOR"))
+    if has_section_title and len(ss) < 400:
         return True
-    # Se não tem nenhuma marcação de seção típica, suspeita de truncamento
-    has_sections = ("1)" in ss and "2)" in ss and "3)" in ss)
-    if not has_sections and len(ss) < 700:
+
+    # ── Verifica estrutura mínima: ao menos 2 seções com conteúdo ──
+    has_numbered = ("1)" in ss and "2)" in ss and "3)" in ss)
+    secoes = sum([
+        1 if "TRADU" in ss_up or "RECADO" in ss_up else 0,
+        1 if "DEBULH" in ss_up or "ECONOM" in ss_up else 0,
+        1 if "PRECISA" in ss_up or "MUDAR" in ss_up or "ACONTEC" in ss_up else 0,
+        1 if "PRÁTICA" in ss_up or "MENTOR" in ss_up or "CONSELHO" in ss_up or "AÇÃO" in ss_up else 0,
+    ])
+    has_titled = secoes >= 2
+
+    if not has_numbered and not has_titled and len(ss) < 700:
         return True
     return False
 
@@ -830,8 +959,28 @@ def _fallback_explicacao_humana(card: "DecisaoCard") -> str:
         linhas.append(f"- Payback: {getattr(ret,'payback_str','N/D')}.")
     linhas.append("")
     linhas.append("3) O que eu faria na prática")
-    linhas.append("- Se estiver acima do teto e com tendência fraca: esperar ajuste de preço e estabilização.")
-    linhas.append("- Reavaliar quando o ágio cair e a tendência/regularidade melhorarem.")
+
+    # ✅ FIX: texto baseado na decisão real do card (não mais texto fixo de VERMELHO)
+    decisao_str = str(getattr(card, "decisao", "") or "")
+    agio  = getattr(v, "agio_pct", 0) if v else 0
+    cv    = getattr(q, "cv", 0) if q else 0
+    trend = str(getattr(q, "tendencia_6m", "") if q else "")
+
+    if "APORTAR" in decisao_str or "🟢" in decisao_str:
+        linhas.append(f"- Ativo em zona de aporte: preço abaixo do teto com ágio de {agio:+.1f}% — boa margem de segurança.")
+        if cv > 0.10:
+            linhas.append(f"- Regularidade ainda instável (CV {cv:.3f}) — considere aportar em parcelas menores.")
+        else:
+            linhas.append(f"- Regularidade adequada (CV {cv:.3f}) — ativo consistente na geração de renda.")
+        linhas.append("- Recomendação: aproveitar o preço atual para aumentar posição gradualmente.")
+    elif "MANTER" in decisao_str or "🟡" in decisao_str:
+        linhas.append(f"- Ativo em zona neutra: ágio de {agio:+.1f}% em relação ao teto — não está barato o suficiente para aportar agressivamente.")
+        linhas.append("- Recomendação: manter a posição atual e monitorar. Não vender, mas também não aportar forte agora.")
+    else:  # AGUARDAR / VERMELHO
+        linhas.append(f"- Ativo acima do preço teto: ágio de {agio:+.1f}% indica preço esticado.")
+        if "queda" in trend.lower():
+            linhas.append("- Tendência de queda reforça a cautela — aguarde estabilização antes de agir.")
+        linhas.append("- Recomendação: aguardar ajuste de preço e reavaliar quando o ágio cair.")
 
     return "\n".join(linhas).strip()
 
