@@ -5,7 +5,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, date
+from dateutil.relativedelta import relativedelta
 from typing import Optional, Dict, Any, List
 
 import requests
@@ -109,13 +110,45 @@ class ProventoAnunciado:
     capturado_em: str = ""
 
     def to_row(self) -> Dict[str, Any]:
+        # ✅ FIX 2: exporta bruto_total e liq_total para o job calcular ir_por_cota
+        _bruto_total = getattr(self, "_val_bruto_total", None)
+        _liq_total   = getattr(self, "_val_liq_total", None)
+
+        # Calcula IR total se temos os dois valores do site
+        _ir_total = None
+        if _bruto_total is not None and _liq_total is not None:
+            _ir_total = round(float(_bruto_total) - float(_liq_total), 6)
+            if _ir_total < 0:
+                _ir_total = None  # sanidade
+
+        # ✅ Cálculo automático de IR por cota quando o site não retornou líquido
+        # JCP: IR fixo 15% PF | RENDIMENTO_TRIB: IR fixo 15% | RENDIMENTO/DIVIDENDO: isento
+        vpc = self.valor_por_cota  # valor capturado = bruto por cota
+        ir_por_cota_calc = None
+        vpc_liq_calc = None
+
+        if vpc is not None and vpc > 0:
+            tp = (self.tipo_pagamento or "").upper()
+            if tp in ("JCP", "RENDIMENTO_TRIB"):
+                ir_por_cota_calc  = round(float(vpc) * 0.15, 8)
+                vpc_liq_calc      = round(float(vpc) * 0.85, 8)
+            else:
+                # RENDIMENTO de FII / DIVIDENDO: isento
+                ir_por_cota_calc = 0.0
+                vpc_liq_calc     = float(vpc)
+
         return {
             "ticker": self.ticker,
             "status": self.status,
             "tipo_pagamento": self.tipo_pagamento,
             "data_com": self.data_com or "",
             "data_pagamento": self.data_pagamento or "",
-            "valor_por_cota": ("" if self.valor_por_cota is None else float(self.valor_por_cota)),
+            "valor_por_cota": vpc_liq_calc if vpc_liq_calc is not None else ("" if vpc is None else float(vpc)),
+            "valor_bruto_por_cota": ("" if vpc is None else float(vpc)),   # ✅ bruto = o que o site capturou
+            "ir_por_cota": ir_por_cota_calc if ir_por_cota_calc is not None else "",  # ✅ calculado
+            "valor_bruto_total": _bruto_total,
+            "ir_total": _ir_total,
+            "valor_liq_total": _liq_total,
             "fonte_url": self.fonte_url,
             "fonte_nome": self.fonte_nome,
             "capturado_em": self.capturado_em or datetime.now().strftime("%Y-%m-%d %H:%M"),
@@ -133,6 +166,7 @@ def fetch_investidor10(ticker: str) -> List[ProventoAnunciado]:
     ]
 
     hoje = datetime.now().date()
+    limite = hoje - relativedelta(months=3)  # captura até 3 meses atrás
 
     for url in urls_to_try:
         is_fundo = ("/fiis/" in url) or ("/fiagros/" in url)
@@ -140,32 +174,55 @@ def fetch_investidor10(ticker: str) -> List[ProventoAnunciado]:
         html = _safe_get(url)
         text = _html_to_text(html)
 
+        # ✅ FIX 1: regex ampliado para capturar "Rend. Trib." e variantes
+        # ✅ FIX 2: captura valor_bruto_por_cota (val_div) e total_liquido (2 valores opcionais após data_pag)
         pattern = re.compile(
-            r"(Dividendos?|Rendimentos?|JSCP|JCP)\s+"
-            r"(\d{2}/\d{2}/\d{4})\s+"
-            r"(\d{2}/\d{2}/\d{4})\s+"
-            r"(\d+[.,]\d+)",
+            r"(Dividendos?|Rendimentos?|Rend\.?\s*Trib\.?|JSCP|JCP)\s+"
+            r"(\d{2}/\d{2}/\d{4})\s+"        # data_com
+            r"(\d{2}/\d{2}/\d{4})\s+"        # data_pagamento
+            r"(\d+[.,]\d+)"                     # valor_div (bruto por cota)
+            r"(?:\s+(\d+[.,]\d+))?"            # valor_total (opcional)
+            r"(?:\s+(\d+[.,]\d+))?",           # total_liquido (opcional)
             re.IGNORECASE,
         )
         matches = pattern.findall(text)
         if not matches:
             continue
 
-        for tipo_raw, dc_raw, dp_raw, val_raw in matches:
-            val = _parse_money_br(val_raw)
-            if val is None: # Removida a trava fixa de > 1000 pois pode haver dividendos altos
+        for match in matches:
+            tipo_raw  = match[0]
+            dc_raw    = match[1]
+            dp_raw    = match[2]
+            val_bruto_raw   = match[3]          # valor_div = bruto por cota
+            val_total_raw   = match[4] if len(match) > 4 else ""   # valor_total (qtd * bruto)
+            val_liq_raw     = match[5] if len(match) > 5 else ""   # total_liquido
+
+            val_bruto = _parse_money_br(val_bruto_raw)
+            if val_bruto is None:
                 continue
+
+            # total_liquido é o líquido total — divide por quantidade para obter líquido/cota
+            # Mas quantidade não está disponível aqui — guardamos os totais e calculamos depois
+            val_liq_total = _parse_money_br(val_liq_raw) if val_liq_raw else None
+            val_bruto_total = _parse_money_br(val_total_raw) if val_total_raw else None
+
+            # valor_por_cota = bruto por cota (val_div)
+            # valor_bruto_por_cota = igual ao valor_por_cota (é o que o site chama de bruto)
+            # ir_por_cota = calculado se tivermos bruto_total e liq_total e quantidade
+            # Como não temos quantidade aqui, guardamos bruto e liq totais para o job calcular
 
             dc = _parse_date_iso(dc_raw)
             dp = _parse_date_iso(dp_raw)
 
             dp_obj = _get_date_obj(dp) if dp else None
-            if not (dp_obj and dp_obj >= hoje):
+            if not (dp_obj and dp_obj >= limite):
                 continue
 
             tipo_upper = (tipo_raw or "").upper().strip()
-            if "JSCP" in tipo_upper:
+            if "JSCP" in tipo_upper or "JCP" in tipo_upper:
                 tipo_final = "JCP"
+            elif "REND" in tipo_upper and "TRIB" in tipo_upper:
+                tipo_final = "RENDIMENTO_TRIB"   # usuário ajusta ao salvar
             elif "DIVIDENDO" in tipo_upper:
                 tipo_final = "RENDIMENTO" if is_fundo else "DIVIDENDO"
             elif "RENDIMENTO" in tipo_upper:
@@ -179,13 +236,16 @@ def fetch_investidor10(ticker: str) -> List[ProventoAnunciado]:
                 fonte_nome="INVESTIDOR10",
                 data_com=dc,
                 data_pagamento=dp,
-                valor_por_cota=float(val),
+                valor_por_cota=float(val_bruto),
                 tipo_pagamento=tipo_final,
             )
+            # ✅ FIX 2: guarda bruto total e líquido total para o job calcular IR/cota
+            prov._val_bruto_total = val_bruto_total   # type: ignore[attr-defined]
+            prov._val_liq_total   = val_liq_total     # type: ignore[attr-defined]
 
-            # Dedup local
+            # Dedup local (por data_pag + tipo + valor — permite dois RENDIMENTO no mesmo dia com valores diferentes)
             if not any(
-                (r.data_pagamento == prov.data_pagamento and r.valor_por_cota == prov.valor_por_cota and r.tipo_pagamento == prov.tipo_pagamento)
+                (r.data_pagamento == prov.data_pagamento and r.tipo_pagamento == prov.tipo_pagamento and r.valor_por_cota == prov.valor_por_cota)
                 for r in resultados
             ):
                 resultados.append(prov)
@@ -208,6 +268,7 @@ def fetch_statusinvest(ticker: str) -> List[ProventoAnunciado]:
     ]
 
     hoje = datetime.now().date()
+    limite = hoje - relativedelta(months=3)  # captura até 3 meses atrás
 
     for url in urls_to_try:
         is_fundo = ("/fundos-imobiliarios/" in url) or ("/fiagros/" in url)
@@ -257,7 +318,7 @@ def fetch_statusinvest(ticker: str) -> List[ProventoAnunciado]:
             tipo_final = "RENDIMENTO"
 
         dp_obj = _get_date_obj(data_pag) if data_pag else None
-        if dp_obj and dp_obj >= hoje:
+        if dp_obj and dp_obj >= limite:
             if val and _valor_parece_valido(val) and data_pag:
                 prov = ProventoAnunciado(
                     ticker=t,
@@ -297,7 +358,7 @@ def fetch_provento_anunciado(ticker: str, logs: Optional[List[str]] = None) -> L
             if lista_provs:
                 output = [p.to_row() for p in lista_provs]
                 output.sort(key=lambda x: x.get("data_pagamento", "9999-99-99"))
-                log(f"✅ {name}: Encontrados {len(output)} anúncios futuros.")
+                log(f"✅ {name}: Encontrados {len(output)} anúncios (janela: 3 meses atrás → futuro).")
                 for item in output:
                     log(f"   -> Pag: {item['data_pagamento']} | Val: {item['valor_por_cota']} | Tipo: {item['tipo_pagamento']}")
                 return output
@@ -305,5 +366,5 @@ def fetch_provento_anunciado(ticker: str, logs: Optional[List[str]] = None) -> L
         except Exception as e:
             log(f"❌ Erro em {name}: {e}")
 
-    log("❌ Nenhuma previsão futura encontrada.")
+    log("❌ Nenhum provento encontrado na janela de 3 meses.")
     return []
