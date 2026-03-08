@@ -109,48 +109,54 @@ class ProventoAnunciado:
     capturado_em: str = ""
 
     def to_row(self) -> Dict[str, Any]:
-        # ✅ FIX 2: exporta bruto_total e liq_total para o job calcular ir_por_cota
-        _bruto_total = getattr(self, "_val_bruto_total", None)
-        _liq_total   = getattr(self, "_val_liq_total", None)
+        # ══════════════════════════════════════════════════════════════════════
+        # self.valor_por_cota = BRUTO por cota (conforme capturado pelo fetch)
+        # _val_liq_por_cota   = líquido por cota (real do site, quando disponível)
+        # _val_ir_por_cota    = IR por cota (real do site, quando disponível)
+        #
+        # Para JCP/RENDIMENTO_TRIB sem dados reais do site: calcula 15% fixo PF
+        # Para DIVIDENDO/RENDIMENTO de FII: IR = 0 (isento)
+        # ══════════════════════════════════════════════════════════════════════
+        vpc_bruto = self.valor_por_cota  # sempre é o BRUTO
+        _liq_site = getattr(self, "_val_liq_por_cota", None)   # líquido real do site
+        _ir_site  = getattr(self, "_val_ir_por_cota",  None)   # IR real do site
 
-        # Calcula IR total se temos os dois valores do site
-        _ir_total = None
-        if _bruto_total is not None and _liq_total is not None:
-            _ir_total = round(float(_bruto_total) - float(_liq_total), 6)
-            if _ir_total < 0:
-                _ir_total = None  # sanidade
-
-        # ✅ Cálculo automático de IR por cota quando o site não retornou líquido
-        # JCP: IR fixo 15% PF | RENDIMENTO_TRIB: IR fixo 15% | RENDIMENTO/DIVIDENDO: isento
-        vpc = self.valor_por_cota  # valor capturado = bruto por cota
-        ir_por_cota_calc = None
-        vpc_liq_calc = None
-
-        if vpc is not None and vpc > 0:
-            tp = (self.tipo_pagamento or "").upper()
-            if tp in ("JCP", "RENDIMENTO_TRIB"):
-                ir_por_cota_calc  = round(float(vpc) * 0.15, 8)
-                vpc_liq_calc      = round(float(vpc) * 0.85, 8)
+        # Decide ir_por_cota e vpc_liq: prioriza dado real do site, fallback calcula
+        tp = (self.tipo_pagamento or "").upper()
+        if vpc_bruto is not None and vpc_bruto > 0:
+            if _ir_site is not None and _ir_site > 0:
+                # Site retornou IR real — usa direto
+                ir_por_cota = round(float(_ir_site), 8)
+                vpc_liq     = round(float(vpc_bruto) - ir_por_cota, 8)
+            elif _liq_site is not None and _liq_site > 0 and _liq_site < vpc_bruto:
+                # Site retornou líquido real — deriva o IR
+                vpc_liq     = round(float(_liq_site), 8)
+                ir_por_cota = round(float(vpc_bruto) - vpc_liq, 8)
+            elif tp in ("JCP", "RENDIMENTO_TRIB"):
+                # Sem dado real: aplica alíquota fixa 15% PF
+                ir_por_cota = round(float(vpc_bruto) * 0.15, 8)
+                vpc_liq     = round(float(vpc_bruto) * 0.85, 8)
             else:
-                # RENDIMENTO de FII / DIVIDENDO: isento
-                ir_por_cota_calc = 0.0
-                vpc_liq_calc     = float(vpc)
+                # DIVIDENDO / RENDIMENTO FII: isento de IR
+                ir_por_cota = 0.0
+                vpc_liq     = float(vpc_bruto)
+        else:
+            ir_por_cota = None
+            vpc_liq     = None
 
         return {
-            "ticker": self.ticker,
-            "status": self.status,
-            "tipo_pagamento": self.tipo_pagamento,
-            "data_com": self.data_com or "",
-            "data_pagamento": self.data_pagamento or "",
-            "valor_por_cota": vpc_liq_calc if vpc_liq_calc is not None else ("" if vpc is None else float(vpc)),
-            "valor_bruto_por_cota": ("" if vpc is None else float(vpc)),   # ✅ bruto = o que o site capturou
-            "ir_por_cota": ir_por_cota_calc if ir_por_cota_calc is not None else "",  # ✅ calculado
-            "valor_bruto_total": _bruto_total,
-            "ir_total": _ir_total,
-            "valor_liq_total": _liq_total,
-            "fonte_url": self.fonte_url,
-            "fonte_nome": self.fonte_nome,
-            "capturado_em": self.capturado_em or datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "ticker":              self.ticker,
+            "status":              self.status,
+            "tipo_pagamento":      self.tipo_pagamento,
+            "data_com":            self.data_com or "",
+            "data_pagamento":      self.data_pagamento or "",
+            "valor_por_cota":      round(float(vpc_bruto), 8) if vpc_bruto else "",   # BRUTO
+            "valor_bruto_por_cota": round(float(vpc_bruto), 8) if vpc_bruto else "",  # redundante, mesma coisa
+            "valor_liq_por_cota":  vpc_liq     if vpc_liq is not None else "",        # LÍQUIDO
+            "ir_por_cota":         ir_por_cota if ir_por_cota is not None else "",    # IR por cota
+            "fonte_url":           self.fonte_url,
+            "fonte_nome":          self.fonte_nome,
+            "capturado_em":        self.capturado_em or datetime.now().strftime("%Y-%m-%d %H:%M"),
         }
 
 
@@ -194,26 +200,39 @@ def fetch_investidor10(ticker: str) -> List[ProventoAnunciado]:
             continue
 
         for match in matches:
-            tipo_raw  = match[0]
-            dc_raw    = match[1]
-            dp_raw    = match[2]
-            val_bruto_raw   = match[3]          # valor_div = bruto por cota
-            val_total_raw   = match[4] if len(match) > 4 else ""   # valor_total (qtd * bruto)
-            val_liq_raw     = match[5] if len(match) > 5 else ""   # total_liquido
+            tipo_raw = match[0]
+            dc_raw   = match[1]
+            dp_raw   = match[2]
 
-            val_bruto = _parse_money_br(val_bruto_raw)
-            if val_bruto is None:
+            # ══════════════════════════════════════════════════════════════════
+            # Layout real da página pública do Investidor10 (sem login):
+            #   tipo | data_com | data_pag | LIQ/cota | BRUTO/cota | IR/cota
+            #
+            # O site exibe 3 colunas de valor por cota na ordem:
+            #   match[3] = líquido por cota  (menor valor, ex: 0,059621)
+            #   match[4] = bruto por cota    (maior valor, ex: 0,070142)
+            #   match[5] = IR por cota       (diferença,   ex: 0,010521)
+            #
+            # NOTA: "Qtde" não aparece aqui — é dado do usuário logado.
+            # Confirmação matemática: liq + ir == bruto (0,059621 + 0,010521 = 0,070142)
+            # ══════════════════════════════════════════════════════════════════
+            val_liq_raw   = match[3]                               # líquido por cota
+            val_bruto_raw = match[4] if len(match) > 4 else ""    # bruto por cota
+            val_ir_raw    = match[5] if len(match) > 5 else ""    # IR por cota
+
+            val_liq_cota   = _parse_money_br(val_liq_raw)
+            val_bruto_cota = _parse_money_br(val_bruto_raw) if val_bruto_raw else None
+            val_ir_cota    = _parse_money_br(val_ir_raw)    if val_ir_raw    else None
+
+            # Se só vier um valor (match[4] e [5] vazios), trata como bruto
+            # (FIIs sem IR ou statusinvest que retorna apenas 1 valor)
+            if val_bruto_cota is None and val_liq_cota is not None:
+                val_bruto_cota = val_liq_cota
+                val_liq_cota   = None
+                val_ir_cota    = None
+
+            if val_bruto_cota is None:
                 continue
-
-            # total_liquido é o líquido total — divide por quantidade para obter líquido/cota
-            # Mas quantidade não está disponível aqui — guardamos os totais e calculamos depois
-            val_liq_total = _parse_money_br(val_liq_raw) if val_liq_raw else None
-            val_bruto_total = _parse_money_br(val_total_raw) if val_total_raw else None
-
-            # valor_por_cota = bruto por cota (val_div)
-            # valor_bruto_por_cota = igual ao valor_por_cota (é o que o site chama de bruto)
-            # ir_por_cota = calculado se tivermos bruto_total e liq_total e quantidade
-            # Como não temos quantidade aqui, guardamos bruto e liq totais para o job calcular
 
             dc = _parse_date_iso(dc_raw)
             dp = _parse_date_iso(dp_raw)
@@ -226,7 +245,7 @@ def fetch_investidor10(ticker: str) -> List[ProventoAnunciado]:
             if "JSCP" in tipo_upper or "JCP" in tipo_upper:
                 tipo_final = "JCP"
             elif "REND" in tipo_upper and "TRIB" in tipo_upper:
-                tipo_final = "RENDIMENTO_TRIB"   # usuário ajusta ao salvar
+                tipo_final = "RENDIMENTO_TRIB"
             elif "DIVIDENDO" in tipo_upper:
                 tipo_final = "RENDIMENTO" if is_fundo else "DIVIDENDO"
             elif "RENDIMENTO" in tipo_upper:
@@ -240,12 +259,12 @@ def fetch_investidor10(ticker: str) -> List[ProventoAnunciado]:
                 fonte_nome="INVESTIDOR10",
                 data_com=dc,
                 data_pagamento=dp,
-                valor_por_cota=float(val_bruto),
+                valor_por_cota=float(val_bruto_cota),  # sempre salva o BRUTO no dataclass
                 tipo_pagamento=tipo_final,
             )
-            # ✅ FIX 2: guarda bruto total e líquido total para o job calcular IR/cota
-            prov._val_bruto_total = val_bruto_total   # type: ignore[attr-defined]
-            prov._val_liq_total   = val_liq_total     # type: ignore[attr-defined]
+            # Guarda liq/cota e ir/cota reais do site (quando disponíveis)
+            prov._val_liq_por_cota = val_liq_cota    # type: ignore[attr-defined]
+            prov._val_ir_por_cota  = val_ir_cota     # type: ignore[attr-defined]
 
             # ✅ FIX: dedup por data_com + data_pag + tipo + valor
             # Sem data_com na chave, dividendos múltiplos do mesmo período (mesmo valor, mesmo dia de pag) eram descartados
