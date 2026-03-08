@@ -1306,12 +1306,17 @@ def atualizar_snapshot_posicoes(sh, pos_map: dict):
         df_master = _ws_to_df(ws_master)
 
         # ✅ FIX: UNFORMATTED_VALUE retorna células vazias como int 0 em vez de "".
-        # Colunas de texto/data com tipos mistos (str + int) causam TypeError no sort_values.
-        # Força todas as colunas para string nas abas que têm colunas de data/texto.
-        for _df in [df_anun, df_prov]:
-            for _col in _df.columns:
-                if _df[_col].dtype == object or _df[_col].apply(lambda x: isinstance(x, (str, int))).any():
-                    _df[_col] = _df[_col].astype(str).replace("0", "").replace("nan", "")
+        # Normaliza colunas específicas de texto/data para evitar TypeError no sort_values.
+        def _sanitize_str_cols(df, cols):
+            for c in cols:
+                if c in df.columns:
+                    col = df[c]
+                    # se houver coluna duplicada, pega só a primeira
+                    if isinstance(col, pd.DataFrame):
+                        col = col.iloc[:, 0]
+                    df[c] = col.apply(lambda x: "" if (x == 0 or x == "0" or x is None) else str(x)).replace("nan", "")
+        _sanitize_str_cols(df_anun, ["capturado_em", "data_com", "data_pagamento", "atualizado_em"])
+        _sanitize_str_cols(df_prov, ["data", "data_pagamento", "criado_em"])
 
         # ── Sincronizar posicoes_snapshot a partir das movimentacoes ─────────
         # pos_map já foi calculado no início do job (fonte de verdade).
