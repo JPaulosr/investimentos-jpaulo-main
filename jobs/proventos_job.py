@@ -783,11 +783,12 @@ def run() -> None:
     print(f"🧱 Anti-spam: {len(hashes_enviados)} hashes no alerts_log")
 
     # =============================================================================
-    # ✅ SOFT-DELETE PROATIVO: linhas com data_pagamento anterior a 3 meses atrás + ativo=1
+    # ✅ SOFT-DELETE PROATIVO: apaga 30 dias após data_pagamento
+    # Mantém o registro visível por 30 dias após o pagamento, depois arquiva (ativo=0)
     # =============================================================================
     hoje_iso = _today_sp_iso()
     from datetime import timedelta
-    _3m_atras = (datetime.now(tz=TZ_SP) - timedelta(days=90)).strftime("%Y-%m-%d")
+    _limite_delete = (datetime.now(tz=TZ_SP) - timedelta(days=30)).strftime("%Y-%m-%d")
     idx_dp_col = hmap.get("data_pagamento")
     softdelete_updates: List[Dict[str, Any]] = []
     if idx_dp_col:
@@ -798,14 +799,14 @@ def run() -> None:
                 continue
             dp_raw = str(row[idx_dp_col - 1]).strip() if (idx_dp_col - 1) < len(row) else ""
             dp = _norm_date(dp_raw)
-            if dp and dp < _3m_atras:
+            if dp and dp < _limite_delete:
                 softdelete_updates.append({"range": _cell_a1(hmap["ativo"], ridx), "values": [[0]]})
                 eid_row = str(row[idx_event_id - 1]).strip() if (idx_event_id - 1) < len(row) else ""
                 if eid_row:
                     existing_ativo[eid_row] = "0"
         if softdelete_updates:
             ws_anun.batch_update(softdelete_updates)
-            print(f"🗑️ Soft-delete proativo: {len(softdelete_updates)} linhas com data_pagamento < 3 meses atrás marcadas como ativo=0")
+            print(f"🗑️ Soft-delete proativo: {len(softdelete_updates)} linhas com data_pagamento > 30 dias marcadas como ativo=0")
 
     # =============================================================================
     # ✅ ALERTA ANTECIPADO: HOJE TEM PAGAMENTO (varre planilha antes do fetch)
