@@ -6,7 +6,6 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import datetime, date
-from dateutil.relativedelta import relativedelta
 from typing import Optional, Dict, Any, List
 
 import requests
@@ -166,7 +165,6 @@ def fetch_investidor10(ticker: str) -> List[ProventoAnunciado]:
     ]
 
     hoje = datetime.now().date()
-    limite = hoje - relativedelta(months=3)  # captura até 3 meses atrás
 
     for url in urls_to_try:
         is_fundo = ("/fiis/" in url) or ("/fiagros/" in url)
@@ -215,7 +213,7 @@ def fetch_investidor10(ticker: str) -> List[ProventoAnunciado]:
             dp = _parse_date_iso(dp_raw)
 
             dp_obj = _get_date_obj(dp) if dp else None
-            if not (dp_obj and dp_obj >= limite):
+            if not (dp_obj and dp_obj >= hoje):
                 continue
 
             tipo_upper = (tipo_raw or "").upper().strip()
@@ -268,7 +266,6 @@ def fetch_statusinvest(ticker: str) -> List[ProventoAnunciado]:
     ]
 
     hoje = datetime.now().date()
-    limite = hoje - relativedelta(months=3)  # captura até 3 meses atrás
 
     for url in urls_to_try:
         is_fundo = ("/fundos-imobiliarios/" in url) or ("/fiagros/" in url)
@@ -318,7 +315,7 @@ def fetch_statusinvest(ticker: str) -> List[ProventoAnunciado]:
             tipo_final = "RENDIMENTO"
 
         dp_obj = _get_date_obj(data_pag) if data_pag else None
-        if dp_obj and dp_obj >= limite:
+        if dp_obj and dp_obj >= hoje:
             if val and _valor_parece_valido(val) and data_pag:
                 prov = ProventoAnunciado(
                     ticker=t,
@@ -358,7 +355,7 @@ def fetch_provento_anunciado(ticker: str, logs: Optional[List[str]] = None) -> L
             if lista_provs:
                 output = [p.to_row() for p in lista_provs]
                 output.sort(key=lambda x: x.get("data_pagamento", "9999-99-99"))
-                log(f"✅ {name}: Encontrados {len(output)} anúncios (janela: 3 meses atrás → futuro).")
+                log(f"✅ {name}: Encontrados {len(output)} anúncios futuros.")
                 for item in output:
                     log(f"   -> Pag: {item['data_pagamento']} | Val: {item['valor_por_cota']} | Tipo: {item['tipo_pagamento']}")
                 return output
@@ -366,5 +363,5 @@ def fetch_provento_anunciado(ticker: str, logs: Optional[List[str]] = None) -> L
         except Exception as e:
             log(f"❌ Erro em {name}: {e}")
 
-    log("❌ Nenhum provento encontrado na janela de 3 meses.")
+    log("❌ Nenhuma previsão futura encontrada.")
     return []
