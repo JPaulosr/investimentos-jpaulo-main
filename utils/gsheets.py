@@ -8,6 +8,7 @@ from datetime import datetime
 import unicodedata
 import re
 import time
+import secrets
 
 import pandas as pd
 import streamlit as st
@@ -163,6 +164,72 @@ def _open_ws(sheet_id: str, worksheet_name: str, show_error: bool = True):
         return None
 
 
+def _parse_date_flexible(s: str) -> str:
+    """
+    Normaliza datas para DD/MM/YYYY independente do locale do Google Sheets.
+    Aceita: DD/MM/YYYY (BR), MM/DD/YYYY (US), YYYY-MM-DD (ISO).
+    Retorna a string original se nao conseguir parsear.
+    """
+    if not s or not isinstance(s, str):
+        return s
+    s = s.strip()
+    if not s:
+        return s
+    # ISO (YYYY-MM-DD)
+    if re.match(r"^\d{4}-\d{1,2}-\d{1,2}$", s):
+        try:
+            dt = datetime.strptime(s, "%Y-%m-%d")
+            return dt.strftime("%d/%m/%Y")
+        except Exception:
+            return s
+    # Formato com barras
+    if "/" in s:
+        parts = s.split("/")
+        if len(parts) == 3:
+            try:
+                p0, p1, p2 = int(parts[0].strip()), int(parts[1].strip()), int(parts[2].strip())
+                # Ano no final (4 digitos)
+                if parts[2].strip() and len(parts[2].strip()) == 4:
+                    d, m, y = p0, p1, p2
+                    # Se m > 12 e d <= 12, eh formato MM/DD/YYYY (EUA)
+                    if m > 12 and d <= 12:
+                        d, m = m, d
+                    try:
+                        dt = datetime(y, m, d)
+                        return dt.strftime("%d/%m/%Y")
+                    except Exception:
+                        try:
+                            dt = datetime(y, d, m)
+                            return dt.strftime("%d/%m/%Y")
+                        except Exception:
+                            return s
+            except Exception:
+                return s
+    return s
+
+
+_PURE_DATE_COLS = {
+    "data", "data_pagamento", "data_com", "dt", "data_operacao",
+    "pagamento", "data_dd_mm_yyyy", "data_evento", "data_pag", "data_comp",
+}
+
+
+def _normalize_date_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Detecta colunas de data pelo nome e normaliza para DD/MM/YYYY,
+    corrigindo o problema de locale EUA (MM/DD/YYYY) no Google Sheets.
+    """
+    if df is None or df.empty:
+        return df
+    cols_lower = {c.strip().lower(): c for c in df.columns}
+    for col_key, col_real in cols_lower.items():
+        if col_key in _PURE_DATE_COLS:
+            df[col_real] = df[col_real].apply(
+                lambda x: _parse_date_flexible(str(x)) if pd.notna(x) and str(x).strip() else x
+            )
+    return df
+
+
 def _read_ws_as_df(sheet_id: str, worksheet_name: str, show_error: bool = True) -> pd.DataFrame:
     try:
         ws = _open_ws(sheet_id, worksheet_name, show_error=show_error)
@@ -173,6 +240,8 @@ def _read_ws_as_df(sheet_id: str, worksheet_name: str, show_error: bool = True) 
             return pd.DataFrame()
         headers = [str(h).strip() for h in values[0]]
         df = pd.DataFrame(values[1:], columns=headers)
+        # FIX: normaliza datas independente do locale do Google Sheets (BR ou EUA)
+        df = _normalize_date_columns(df)
         return df
     except Exception:
         return pd.DataFrame()
@@ -579,11 +648,12 @@ def append_provento_legado(row: Dict[str, Any], ws=None) -> bool:
             next_row = 2
 
         updates = {
-            2: str((row or {}).get("ticker", "")).strip().upper(),         # Coluna B
-            3: _fmt_tipo_provento_legado((row or {}).get("tipo", "")),      # Coluna C
-            4: str((row or {}).get("data", "")).strip(),                   # Coluna D
-            5: (row or {}).get("quantidade_na_data", (row or {}).get("quantidade", "")), # Coluna E
-            7: (row or {}).get("valor", ""),                               # Coluna G
+            2: str((row or {}).get("ticker", "")).strip().upper(),         # Coluna B — Ticker
+            3: _fmt_tipo_provento_legado((row or {}).get("tipo", "")),      # Coluna C — Tipo
+            4: str((row or {}).get("data", "")).strip(),                   # Coluna D — Data
+            5: (row or {}).get("quantidade_na_data", (row or {}).get("quantidade", "")), # Coluna E — Qtd
+            7: (row or {}).get("valor", ""),                               # Coluna G — Total Líquido
+            8: (row or {}).get("ir_retido", (row or {}).get("irrf", "")),  # Coluna H — IRRF
         }
         
         _sparse_update_cells(ws, next_row, updates)
