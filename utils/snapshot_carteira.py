@@ -101,10 +101,19 @@ def atualizar_snapshot_carteira(
         df_pa["pvp"] = _to_num(df_pa["pvp"])
 
         if "capturado_em" in df_pa.columns:
-            df_pa["capturado_em"] = df_pa["capturado_em"].replace("", np.nan)
+            # ✅ FIX: UNFORMATTED_VALUE do Sheets retorna células vazias como int 0.
+            # sort_values falha com TypeError ao comparar str com int.
+            # Converte tudo para str e normaliza 0 / "0" para string vazia.
+            df_pa["capturado_em"] = df_pa["capturado_em"].apply(
+                lambda x: "" if (x == 0 or x == "0" or x is None) else str(x)
+            )
 
         pvp_map = (
-            df_pa.sort_values("capturado_em")
+            df_pa.sort_values(
+                "capturado_em",
+                key=lambda s: s.fillna("").astype(str),
+                na_position="first",
+            )
             .drop_duplicates("ticker", keep="last")
             .set_index("ticker")["pvp"]
             .to_dict()
