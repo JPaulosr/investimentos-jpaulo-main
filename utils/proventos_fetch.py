@@ -164,7 +164,12 @@ def fetch_investidor10(ticker: str) -> List[ProventoAnunciado]:
         f"https://investidor10.com.br/acoes/{t.lower()}/",
     ]
 
-    hoje = datetime.now().date()
+    # ✅ FIX 3: usa timezone de Brasília para evitar descartar eventos do dia em UTC-3
+    try:
+        from zoneinfo import ZoneInfo
+        hoje = datetime.now(tz=ZoneInfo("America/Sao_Paulo")).date()
+    except Exception:
+        hoje = datetime.now().date()
 
     for url in urls_to_try:
         is_fundo = ("/fiis/" in url) or ("/fiagros/" in url)
@@ -174,13 +179,14 @@ def fetch_investidor10(ticker: str) -> List[ProventoAnunciado]:
 
         # ✅ FIX 1: regex ampliado para capturar "Rend. Trib." e variantes
         # ✅ FIX 2: captura valor_bruto_por_cota (val_div) e total_liquido (2 valores opcionais após data_pag)
+        # ✅ FIX 2b: \s* em vez de \s+ entre campos — BeautifulSoup pode gerar separadores variados
         pattern = re.compile(
-            r"(Dividendos?|Rendimentos?|Rend\.?\s*Trib\.?|JSCP|JCP)\s+"
-            r"(\d{2}/\d{2}/\d{4})\s+"        # data_com
-            r"(\d{2}/\d{2}/\d{4})\s+"        # data_pagamento
-            r"(\d+[.,]\d+)"                     # valor_div (bruto por cota)
-            r"(?:\s+(\d+[.,]\d+))?"            # valor_total (opcional)
-            r"(?:\s+(\d+[.,]\d+))?",           # total_liquido (opcional)
+            r"(Dividendos?|Rendimentos?|Rend\.?\s*Trib\.?|JSCP|JCP)\s*"
+            r"(\d{2}/\d{2}/\d{4})\s*"        # data_com
+            r"(\d{2}/\d{2}/\d{4})\s*"        # data_pagamento
+            r"(\d+[.,]\d+)"                    # valor_div (bruto por cota)
+            r"(?:\s+(\d+[.,]\d+))?"           # valor_total (opcional)
+            r"(?:\s+(\d+[.,]\d+))?",          # total_liquido (opcional)
             re.IGNORECASE,
         )
         matches = pattern.findall(text)
@@ -241,9 +247,11 @@ def fetch_investidor10(ticker: str) -> List[ProventoAnunciado]:
             prov._val_bruto_total = val_bruto_total   # type: ignore[attr-defined]
             prov._val_liq_total   = val_liq_total     # type: ignore[attr-defined]
 
-            # Dedup local (por data_pag + tipo + valor — permite dois RENDIMENTO no mesmo dia com valores diferentes)
+            # ✅ FIX: dedup por data_com + data_pag + tipo + valor
+            # Sem data_com na chave, dividendos múltiplos do mesmo período (mesmo valor, mesmo dia de pag) eram descartados
             if not any(
-                (r.data_pagamento == prov.data_pagamento and r.tipo_pagamento == prov.tipo_pagamento and r.valor_por_cota == prov.valor_por_cota)
+                (r.data_com == prov.data_com and r.data_pagamento == prov.data_pagamento
+                 and r.tipo_pagamento == prov.tipo_pagamento and r.valor_por_cota == prov.valor_por_cota)
                 for r in resultados
             ):
                 resultados.append(prov)
@@ -265,10 +273,14 @@ def fetch_statusinvest(ticker: str) -> List[ProventoAnunciado]:
         f"https://statusinvest.com.br/acoes/{t.lower()}",
     ]
 
-    hoje = datetime.now().date()
+    # ✅ FIX 3: usa timezone de Brasília para evitar descartar eventos do dia em UTC-3
+    try:
+        from zoneinfo import ZoneInfo
+        hoje = datetime.now(tz=ZoneInfo("America/Sao_Paulo")).date()
+    except Exception:
+        hoje = datetime.now().date()
 
     for url in urls_to_try:
-        is_fundo = ("/fundos-imobiliarios/" in url) or ("/fiagros/" in url)
 
         html = _safe_get(url)
         if "Ops! Página não encontrada" in html:
