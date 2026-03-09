@@ -458,6 +458,11 @@ def load_proventos_anunciados() -> pd.DataFrame:
     return _read_ws_as_df(SHEET_ID, tab, show_error=False)
 
 
+@st.cache_data(show_spinner=False, ttl=300)
+def load_carteira_snapshot() -> pd.DataFrame:
+    return _read_ws_as_df(SHEET_ID, "carteira_snapshot", show_error=False)
+
+
 
 # =============================================================================
 # WRITERS — compatibilidade com pages/04_Adicionar_Operacao.py (base nova + espelho legado)
