@@ -133,9 +133,11 @@ class ProventoAnunciado:
                 vpc_liq     = round(float(_liq_site), 8)
                 ir_por_cota = round(float(vpc_bruto) - vpc_liq, 8)
             elif tp in ("JCP", "RENDIMENTO_TRIB"):
-                # Sem dado real: aplica alíquota fixa 15% PF
-                ir_por_cota = round(float(vpc_bruto) * 0.15, 8)
-                vpc_liq     = round(float(vpc_bruto) * 0.85, 8)
+                # Sem dado real: alíquota por data (LC 224/2025: 17,5% a partir de 01/01/2026)
+                _dp = self.data_pagamento or self.data_com or ""
+                _aliq = 0.175 if _dp >= "2026-01-01" else 0.15
+                ir_por_cota = round(float(vpc_bruto) * _aliq, 8)
+                vpc_liq     = round(float(vpc_bruto) * (1 - _aliq), 8)
             else:
                 # DIVIDENDO / RENDIMENTO FII: isento de IR
                 ir_por_cota = 0.0
