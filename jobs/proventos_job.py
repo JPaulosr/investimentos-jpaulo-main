@@ -989,11 +989,12 @@ def run() -> None:
         if not row_norm.get("status"):
             row_norm["status"] = "ANUNCIADO"
 
-        # quantidade_ref: preenche do pos_map se vazio
-        if not row_norm.get("quantidade_ref"):
-            _qtd_ref = pos_map.get(row_norm["ticker"], 0.0)
-            if _qtd_ref and _qtd_ref > 0:
-                row_norm["quantidade_ref"] = _qtd_ref
+        # quantidade_ref: sempre usa pos_map como fonte de verdade.
+        # Não confia no valor vindo da planilha/evento — pode estar corrompido
+        # (ex: VPC gravado no lugar da quantidade de cotas).
+        _qtd_ref = pos_map.get(row_norm["ticker"], 0.0)
+        if _qtd_ref and _qtd_ref > 0:
+            row_norm["quantidade_ref"] = _qtd_ref
 
         qtd = float(pos_map.get(row_norm["ticker"], 0.0) or 0.0)
         posicao = {"qtd": qtd} if qtd > 0 else None
@@ -1477,42 +1478,53 @@ def repair_empty_fields(sh: gspread.Spreadsheet, meta_map: Dict[str, Any], pos_m
                 tp_val      = _cell(idx_tp) if idx_tp else ""
 
                 # ══════════════════════════════════════════════════════════════
-                # DETECÇÃO DE DADOS CORROMPIDOS (bug do scraper antigo):
-                # Sintoma: quantidade_ref < 10 mas é um valor monetário fracionado
-                #          (ex: 0.070142 em vez de 210)
-                # O scraper antigo salvava: vpc=liq/cota, qtd_ref=bruto/cota, pvp=ir/cota
-                # Estratégia: se qtd < 10 e pos_map tem quantidade real → corrige todos os campos
+                # DETECÇÃO DE DADOS CORROMPIDOS:
+                # Cenário A (scraper antigo): campos trocados — qtd_ref tinha o bruto/cota,
+                #   valor_por_cota tinha o liq/cota, pvp tinha o ir/cota.
+                #   Detectado por: 0 < qtd < 10 E qtd_real >= 10
+                # Cenário B (bug atual): só quantidade errada — VPC foi gravado no lugar
+                #   das cotas (ex: 1.10 em vez de 44). Os outros campos já estão corretos.
+                #   Detectado por: qtd > 0 E qtd < qtd_real * 0.5 (menos da metade da real)
                 # ══════════════════════════════════════════════════════════════
                 qtd_real = pos_map.get(tk, 0.0)
-                is_corrupted = (
+                is_cenario_a = (
                     cur_qtd is not None
                     and 0 < cur_qtd < 10
                     and qtd_real >= 10
                 )
+                is_cenario_b = (
+                    not is_cenario_a
+                    and cur_qtd is not None
+                    and cur_qtd > 0
+                    and qtd_real >= 1
+                    and cur_qtd < qtd_real * 0.5
+                )
 
-                if is_corrupted and idx_vpc and idx_vbc and idx_ir and idx_pvp:
-                    # cur_qtd_str é na verdade o bruto/cota
-                    # _cell(idx_vpc) é na verdade o liq/cota
-                    # _cell(idx_pvp) é na verdade o ir/cota
+                if is_cenario_a and idx_vpc and idx_vbc and idx_ir and idx_pvp:
+                    # Campos todos trocados — reconstrói a partir dos valores corrompidos
                     bruto_cota = cur_qtd               # estava em quantidade_ref
                     liq_cota   = _to_f(_cell(idx_vpc)) # estava em valor_por_cota
                     ir_cota    = _to_f(_cell(idx_pvp))  # estava em pvp
 
                     if bruto_cota and liq_cota and bruto_cota > liq_cota:
-                        # Sanidade: bruto > liq, e ir = bruto - liq
                         ir_recalc = round(bruto_cota - liq_cota, 8)
-                        updates.append({"range": _cell_a1(idx_vpc, ridx), "values": [[bruto_cota]]})  # vpc = bruto
-                        updates.append({"range": _cell_a1(idx_vbc, ridx), "values": [[bruto_cota]]})  # vbc = bruto
+                        updates.append({"range": _cell_a1(idx_vpc, ridx), "values": [[bruto_cota]]})
+                        updates.append({"range": _cell_a1(idx_vbc, ridx), "values": [[bruto_cota]]})
                         if idx_vlc:
-                            updates.append({"range": _cell_a1(idx_vlc, ridx), "values": [[liq_cota]]})   # vlc = liq
-                        updates.append({"range": _cell_a1(idx_ir,  ridx), "values": [[ir_recalc]]})    # ir = diferença
-                        updates.append({"range": _cell_a1(idx_qtd, ridx), "values": [[qtd_real]]})     # qtd = real
-                        # Preserva pvp real buscando do meta_map (não o valor corrompido)
+                            updates.append({"range": _cell_a1(idx_vlc, ridx), "values": [[liq_cota]]})
+                        updates.append({"range": _cell_a1(idx_ir,  ridx), "values": [[ir_recalc]]})
+                        updates.append({"range": _cell_a1(idx_qtd, ridx), "values": [[qtd_real]]})
                         pvp_real = _to_f(str(meta_map.get(tk, {}).get("pvp") or ""))
                         if pvp_real:
                             updates.append({"range": _cell_a1(idx_pvp, ridx), "values": [[pvp_real]]})
-                        print(f"  🔧 {tk}: corrigido dados corrompidos — vpc {liq_cota}→{bruto_cota}, qtd {cur_qtd}→{qtd_real}")
+                        print(f"  🔧 {tk}: cenário A corrigido — vpc {liq_cota}→{bruto_cota}, qtd {cur_qtd}→{qtd_real}")
                         row_fixed = True
+
+                elif is_cenario_b:
+                    # Só a quantidade está errada (VPC no lugar das cotas) — corrige apenas qtd
+                    updates.append({"range": _cell_a1(idx_qtd, ridx), "values": [[qtd_real]]})
+                    print(f"  🔧 {tk}: cenário B corrigido — qtd {cur_qtd}→{qtd_real}")
+                    row_fixed = True
 
                 elif not cur_qtd_str or cur_qtd == 0:
                     # Quantidade simplesmente vazia — preenche do pos_map
