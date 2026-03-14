@@ -1301,14 +1301,26 @@ def atualizar_cotacoes_cache(sh, tickers: list):
         for t_yf, t_orig in zip(tickers_yf, tickers):
             try:
                 ticker_obj = yf.Ticker(t_yf)
+                # Tenta period="2d" primeiro, fallback para "5d"
                 hist = ticker_obj.history(period="2d")
+                if hist.empty:
+                    hist = ticker_obj.history(period="5d")
                 if not hist.empty:
                     preco = float(hist["Close"].iloc[-1])
                     precos[t_orig] = round(preco, 2)
                     print(f"  ✅ {t_orig}: R$ {preco:.2f}")
                 else:
-                    print(f"  ⚠️ {t_orig}: sem dados no yfinance")
-                _t.sleep(0.3)  # anti-throttle
+                    # Fallback: tenta via fast_info
+                    try:
+                        preco = float(ticker_obj.fast_info["last_price"])
+                        if preco and preco > 0:
+                            precos[t_orig] = round(preco, 2)
+                            print(f"  ✅ {t_orig} (fast_info): R$ {preco:.2f}")
+                        else:
+                            print(f"  ⚠️ {t_orig}: sem dados no yfinance")
+                    except Exception:
+                        print(f"  ⚠️ {t_orig}: sem dados no yfinance")
+                _t.sleep(0.5)  # anti-throttle
             except Exception as e:
                 print(f"  ❌ {t_orig}: erro yfinance — {e}")
 
