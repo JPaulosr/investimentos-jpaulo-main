@@ -1276,6 +1276,55 @@ def run() -> None:
     print("🏁 Concluído.")
 
 
+
+# =============================================================================
+# BUSCA E ATUALIZA COTAÇÕES VIA YFINANCE
+# =============================================================================
+def atualizar_cotacoes_cache(sh, tickers: list):
+    """
+    Busca preços atuais via yfinance para os tickers da posição
+    e grava na aba cotacoes_cache.
+    Tickers B3: adiciona .SA automaticamente.
+    """
+    if not tickers:
+        print("⚠️ cotacoes_cache: nenhum ticker para buscar.")
+        return
+
+    try:
+        import yfinance as yf
+        import time as _t
+
+        tickers_yf = [f"{t}.SA" if not t.endswith(".SA") else t for t in tickers]
+        print(f"📈 Buscando cotações: {tickers_yf}")
+
+        precos = {}
+        for t_yf, t_orig in zip(tickers_yf, tickers):
+            try:
+                ticker_obj = yf.Ticker(t_yf)
+                hist = ticker_obj.history(period="2d")
+                if not hist.empty:
+                    preco = float(hist["Close"].iloc[-1])
+                    precos[t_orig] = round(preco, 2)
+                    print(f"  ✅ {t_orig}: R$ {preco:.2f}")
+                else:
+                    print(f"  ⚠️ {t_orig}: sem dados no yfinance")
+                _t.sleep(0.3)  # anti-throttle
+            except Exception as e:
+                print(f"  ❌ {t_orig}: erro yfinance — {e}")
+
+        if not precos:
+            print("❌ cotacoes_cache: nenhuma cotação obtida.")
+            return
+
+        ws_cot = sh.worksheet("cotacoes_cache")
+        rows = [["ticker", "preco"]] + [[t, p] for t, p in sorted(precos.items())]
+        ws_cot.clear()
+        ws_cot.update(rows, value_input_option="RAW")
+        print(f"✅ cotacoes_cache atualizado: {len(precos)} tickers")
+
+    except Exception as e:
+        print(f"❌ Erro ao atualizar cotacoes_cache: {e}")
+
 # =============================================================================
 # SNAPSHOT CARTEIRA (executado após o robô)
 # =============================================================================
@@ -1289,6 +1338,13 @@ def atualizar_snapshot_posicoes(sh, pos_map: dict):
 
     try:
         _time.sleep(5)  # anti-quota antes do bloco de leituras do snapshot
+
+        # ── Atualiza cotações via yfinance antes do snapshot ──────────────────
+        _tickers_pos = [tk for tk, qtd in pos_map.items() if qtd > 0]
+        atualizar_cotacoes_cache(sh, _tickers_pos)
+        _time.sleep(2)  # anti-quota após gravação
+        # ─────────────────────────────────────────────────────────────────────
+
         ws_pos    = sh.worksheet("posicoes_snapshot")
         ws_cot    = sh.worksheet("cotacoes_cache")
         ws_prov   = sh.worksheet("proventos")
