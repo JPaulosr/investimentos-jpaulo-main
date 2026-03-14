@@ -1249,7 +1249,7 @@ def run() -> None:
             agg2[tk] = agg2.get(tk, 0.0) + float(v)
         itens_ord2 = sorted(agg2.items(), key=lambda x: x[1], reverse=True)
 
-        hday = _sha1("PAYDAY|" + hoje_iso + "|" + ",".join([x[0] for x in itens_ord2]))
+        hday = _sha1("PAYDAY|" + hoje_iso + "|" + ",".join(sorted([x[0] for x in itens_ord2])))
         if hday not in hashes_enviados:
             linhas2 = [f"• {_fmt_ddmm(hoje_iso)} — {tk}: R$ {_fmt_money_br(val)}" for tk, val in itens_ord2[:12]]
             msg2 = (
