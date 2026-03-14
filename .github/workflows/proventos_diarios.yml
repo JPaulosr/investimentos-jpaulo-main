@@ -1,9 +1,9 @@
-name: Robô Proventos (Diário 09h)
+name: Robô Proventos (Diário 12h)
 
 on:
   schedule:
-    # 12:00 UTC = 09:00 Brasil
-    - cron: "0 12 * * *"
+    # 15:00 UTC = 12:00 Brasil
+    - cron: "0 15 * * *"
   workflow_dispatch:
 
 jobs:
@@ -20,13 +20,11 @@ jobs:
           python-version: "3.11"
 
       - name: Instalar Dependências
-        # Instala requests, pandas, gspread E beautifulsoup4 (necessário pro seu utils)
         run: |
-          pip install requests pandas gspread google-auth beautifulsoup4
+          pip install requests pandas gspread google-auth beautifulsoup4 yfinance
 
       - name: Executar Robô
         env:
-          # Seus segredos já configurados
           GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
           SHEET_ID_NOVO: ${{ secrets.SHEET_ID_NOVO }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
