@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import re
+import json
 from dataclasses import dataclass
 from datetime import datetime, date
 from typing import Optional, Dict, Any, List
@@ -31,6 +32,14 @@ def _safe_get(url: str, timeout: int = 15) -> str:
         return r.text
     except Exception:
         return ""
+
+def _safe_get_json(url: str, timeout: int = 15) -> Any:
+    try:
+        r = requests.get(url, headers=_HEADERS, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
 
 def _clean_text(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
@@ -92,7 +101,6 @@ def _parse_money_br(s: str) -> Optional[float]:
 def _valor_parece_valido(v: float) -> bool:
     if v <= 0:
         return False
-    # Removido limite superior de 1000 — dividendos de ações podem ser altos
     return True
 
 
@@ -114,7 +122,7 @@ class ProventoAnunciado:
         # _val_liq_por_cota   = líquido por cota (real do site, quando disponível)
         # _val_ir_por_cota    = IR por cota (real do site, quando disponível)
         #
-        # Para JCP/RENDIMENTO_TRIB sem dados reais do site: calcula 15% fixo PF
+        # Para JCP/RENDIMENTO_TRIB sem dados reais do site: calcula 17,5% (LC 224/2025)
         # Para DIVIDENDO/RENDIMENTO de FII: IR = 0 (isento)
         # ══════════════════════════════════════════════════════════════════════
         vpc_bruto = self.valor_por_cota  # sempre é o BRUTO
@@ -162,22 +170,171 @@ class ProventoAnunciado:
         }
 
 
+# =============================================================================
+# ✅ NOVO: busca via API JSON do Investidor10 — retorna valor com 8 casas decimais
+# O HTML público exibe valor arredondado (ex: 0,18), a API retorna 0,17518233
+# Endpoint: /api/v2/acoes/{ticker}/dividendos/?page=1
+# =============================================================================
+def _fetch_investidor10_api(ticker: str, hoje) -> List[ProventoAnunciado]:
+    """
+    Tenta buscar proventos via API JSON do Investidor10.
+    Retorna lista vazia se a API não responder ou não tiver dados futuros.
+    """
+    t = ticker.upper().strip()
+    resultados: List[ProventoAnunciado] = []
+
+    # A API do Investidor10 retorna JSON com valores completos (sem arredondamento)
+    api_url = f"https://investidor10.com.br/api/v2/acoes/{t.lower()}/dividendos/?page=1"
+
+    data = _safe_get_json(api_url)
+    if not data:
+        return []
+
+    # Estrutura esperada: {"results": [...]} ou lista direta
+    items = []
+    if isinstance(data, dict):
+        items = data.get("results", data.get("data", data.get("dividendos", [])))
+    elif isinstance(data, list):
+        items = data
+
+    if not items:
+        return []
+
+    # Mapeamento de campos — o Investidor10 pode usar nomes variados
+    _TIPO_MAP = {
+        "jscp": "JCP",
+        "jcp": "JCP",
+        "juros sobre capital proprio": "JCP",
+        "dividendo": "DIVIDENDO",
+        "dividendos": "DIVIDENDO",
+        "rendimento tributavel": "RENDIMENTO_TRIB",
+        "rendimento trib": "RENDIMENTO_TRIB",
+        "rend. trib.": "RENDIMENTO_TRIB",
+        "rendimento": "RENDIMENTO",
+    }
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        # Extrai data_com
+        dc_raw = (
+            item.get("data_com") or item.get("dataCom") or
+            item.get("ex_date") or item.get("exDate") or ""
+        )
+        # Extrai data_pagamento
+        dp_raw = (
+            item.get("data_pagamento") or item.get("dataPagamento") or
+            item.get("payment_date") or item.get("paymentDate") or
+            item.get("data_pagto") or ""
+        )
+        # Extrai valor bruto — prioriza campos com nome "bruto"
+        valor_bruto = (
+            item.get("valor_bruto") or item.get("valorBruto") or
+            item.get("value") or item.get("valor") or
+            item.get("dividend_value") or item.get("dividendValue") or
+            item.get("valor_por_cota") or item.get("valorPorCota") or 0
+        )
+        # Extrai valor líquido (quando disponível)
+        valor_liq = (
+            item.get("valor_liquido") or item.get("valorLiquido") or
+            item.get("net_value") or item.get("netValue") or None
+        )
+        # Extrai IR (quando disponível)
+        valor_ir = (
+            item.get("ir") or item.get("imposto") or
+            item.get("tax_value") or item.get("taxValue") or None
+        )
+        # Extrai tipo
+        tipo_raw = str(
+            item.get("tipo") or item.get("type") or
+            item.get("tipo_pagamento") or item.get("tipoPagamento") or
+            item.get("dividend_type") or "dividendo"
+        ).strip().lower()
+
+        dc = _parse_date_iso(str(dc_raw)) if dc_raw else None
+        dp = _parse_date_iso(str(dp_raw)) if dp_raw else None
+
+        # Só registros com data de pagamento futura (ou hoje)
+        dp_obj = _get_date_obj(dp) if dp else None
+        if not (dp_obj and dp_obj >= hoje):
+            continue
+
+        # Converte valor para float (já vem com ponto decimal da API)
+        try:
+            vpc = float(str(valor_bruto).replace(",", "."))
+        except Exception:
+            continue
+        if not vpc or vpc <= 0:
+            continue
+
+        # Converte liq/ir se disponíveis
+        try:
+            vpc_liq = float(str(valor_liq).replace(",", ".")) if valor_liq else None
+        except Exception:
+            vpc_liq = None
+        try:
+            vpc_ir = float(str(valor_ir).replace(",", ".")) if valor_ir else None
+        except Exception:
+            vpc_ir = None
+
+        # Mapeia tipo
+        tipo_final = _TIPO_MAP.get(tipo_raw, "DIVIDENDO")
+
+        prov = ProventoAnunciado(
+            ticker=t,
+            fonte_url=api_url,
+            fonte_nome="INVESTIDOR10_API",
+            data_com=dc,
+            data_pagamento=dp,
+            valor_por_cota=vpc,
+            tipo_pagamento=tipo_final,
+        )
+        prov._val_liq_por_cota = vpc_liq  # type: ignore[attr-defined]
+        prov._val_ir_por_cota  = vpc_ir   # type: ignore[attr-defined]
+
+        # Dedup por data_com + data_pag + tipo + valor (8 casas)
+        chave = (prov.data_com, prov.data_pagamento, prov.tipo_pagamento, round(vpc, 8))
+        if not any(
+            (r.data_com, r.data_pagamento, r.tipo_pagamento, round(r.valor_por_cota or 0, 8)) == chave
+            for r in resultados
+        ):
+            resultados.append(prov)
+
+    return resultados
+
+
 def fetch_investidor10(ticker: str) -> List[ProventoAnunciado]:
     t = (ticker or "").upper().strip()
     resultados: List[ProventoAnunciado] = []
 
-    urls_to_try = [
-        f"https://investidor10.com.br/fiis/{t.lower()}/",
-        f"https://investidor10.com.br/fiagros/{t.lower()}/",
-        f"https://investidor10.com.br/acoes/{t.lower()}/",
-    ]
-
-    # ✅ FIX 3: usa timezone de Brasília para evitar descartar eventos do dia em UTC-3
+    # ✅ Timezone de Brasília
     try:
         from zoneinfo import ZoneInfo
         hoje = datetime.now(tz=ZoneInfo("America/Sao_Paulo")).date()
     except Exception:
         hoje = datetime.now().date()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # PASSO 1: tenta API JSON (valores com 8 casas decimais, sem arredondamento)
+    # Funciona para ações. Para FIIs a API pode não existir — cai no scraping.
+    # ══════════════════════════════════════════════════════════════════════════
+    try:
+        api_results = _fetch_investidor10_api(t, hoje)
+        if api_results:
+            api_results.sort(key=lambda x: x.data_pagamento or "9999-99-99")
+            return api_results
+    except Exception:
+        pass  # fallback para scraping HTML
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # PASSO 2: fallback — scraping HTML (valor pode vir arredondado para ações)
+    # ══════════════════════════════════════════════════════════════════════════
+    urls_to_try = [
+        f"https://investidor10.com.br/fiis/{t.lower()}/",
+        f"https://investidor10.com.br/fiagros/{t.lower()}/",
+        f"https://investidor10.com.br/acoes/{t.lower()}/",
+    ]
 
     for url in urls_to_try:
         is_fundo = ("/fiis/" in url) or ("/fiagros/" in url)
@@ -185,16 +342,13 @@ def fetch_investidor10(ticker: str) -> List[ProventoAnunciado]:
         html = _safe_get(url)
         text = _html_to_text(html)
 
-        # ✅ FIX 1: regex ampliado para capturar "Rend. Trib." e variantes
-        # ✅ FIX 2: captura valor_bruto_por_cota (val_div) e total_liquido (2 valores opcionais após data_pag)
-        # ✅ FIX 2b: \s* em vez de \s+ entre campos — BeautifulSoup pode gerar separadores variados
         pattern = re.compile(
             r"(Dividendos?|Rendimentos?|Rend\.?\s*Trib\.?|JSCP|JCP)\s*"
             r"(\d{2}/\d{2}/\d{4})\s*"        # data_com
             r"(\d{2}/\d{2}/\d{4})\s*"        # data_pagamento
-            r"(\d+[.,]\d+)"                    # valor_div (bruto por cota)
-            r"(?:\s+(\d+[.,]\d+))?"           # valor_total (opcional)
-            r"(?:\s+(\d+[.,]\d+))?",          # total_liquido (opcional)
+            r"(\d+[.,]\d+)"                    # valor (bruto ou liq dependendo do layout)
+            r"(?:\s+(\d+[.,]\d+))?"           # segundo valor (opcional)
+            r"(?:\s+(\d+[.,]\d+))?",          # terceiro valor (opcional)
             re.IGNORECASE,
         )
         matches = pattern.findall(text)
@@ -206,28 +360,18 @@ def fetch_investidor10(ticker: str) -> List[ProventoAnunciado]:
             dc_raw   = match[1]
             dp_raw   = match[2]
 
-            # ══════════════════════════════════════════════════════════════════
-            # Layout real da página pública do Investidor10 (sem login):
-            #   tipo | data_com | data_pag | LIQ/cota | BRUTO/cota | IR/cota
-            #
-            # O site exibe 3 colunas de valor por cota na ordem:
-            #   match[3] = líquido por cota  (menor valor, ex: 0,059621)
-            #   match[4] = bruto por cota    (maior valor, ex: 0,070142)
-            #   match[5] = IR por cota       (diferença,   ex: 0,010521)
-            #
-            # NOTA: "Qtde" não aparece aqui — é dado do usuário logado.
-            # Confirmação matemática: liq + ir == bruto (0,059621 + 0,010521 = 0,070142)
-            # ══════════════════════════════════════════════════════════════════
-            val_liq_raw   = match[3]                               # líquido por cota
-            val_bruto_raw = match[4] if len(match) > 4 else ""    # bruto por cota
-            val_ir_raw    = match[5] if len(match) > 5 else ""    # IR por cota
+            # Layout página pública Investidor10 (sem login):
+            #   FII logado:  tipo | data_com | data_pag | LIQ/cota | BRUTO/cota | IR/cota
+            #   Ação público: tipo | data_com | data_pag | VALOR (arredondado 2 casas)
+            val_liq_raw   = match[3]
+            val_bruto_raw = match[4] if len(match) > 4 and match[4] else ""
+            val_ir_raw    = match[5] if len(match) > 5 and match[5] else ""
 
             val_liq_cota   = _parse_money_br(val_liq_raw)
             val_bruto_cota = _parse_money_br(val_bruto_raw) if val_bruto_raw else None
             val_ir_cota    = _parse_money_br(val_ir_raw)    if val_ir_raw    else None
 
-            # Se só vier um valor (match[4] e [5] vazios), trata como bruto
-            # (FIIs sem IR ou statusinvest que retorna apenas 1 valor)
+            # Se só vier um valor, trata como bruto
             if val_bruto_cota is None and val_liq_cota is not None:
                 val_bruto_cota = val_liq_cota
                 val_liq_cota   = None
@@ -261,18 +405,15 @@ def fetch_investidor10(ticker: str) -> List[ProventoAnunciado]:
                 fonte_nome="INVESTIDOR10",
                 data_com=dc,
                 data_pagamento=dp,
-                valor_por_cota=float(val_bruto_cota),  # sempre salva o BRUTO no dataclass
+                valor_por_cota=float(val_bruto_cota),
                 tipo_pagamento=tipo_final,
             )
-            # Guarda liq/cota e ir/cota reais do site (quando disponíveis)
-            prov._val_liq_por_cota = val_liq_cota    # type: ignore[attr-defined]
-            prov._val_ir_por_cota  = val_ir_cota     # type: ignore[attr-defined]
+            prov._val_liq_por_cota = val_liq_cota   # type: ignore[attr-defined]
+            prov._val_ir_por_cota  = val_ir_cota    # type: ignore[attr-defined]
 
-            # ✅ FIX: dedup por data_com + data_pag + tipo + valor
-            # Sem data_com na chave, dividendos múltiplos do mesmo período (mesmo valor, mesmo dia de pag) eram descartados
+            chave = (prov.data_com, prov.data_pagamento, prov.tipo_pagamento, round(val_bruto_cota, 8))
             if not any(
-                (r.data_com == prov.data_com and r.data_pagamento == prov.data_pagamento
-                 and r.tipo_pagamento == prov.tipo_pagamento and r.valor_por_cota == prov.valor_por_cota)
+                (r.data_com, r.data_pagamento, r.tipo_pagamento, round(r.valor_por_cota or 0, 8)) == chave
                 for r in resultados
             ):
                 resultados.append(prov)
@@ -294,7 +435,6 @@ def fetch_statusinvest(ticker: str) -> List[ProventoAnunciado]:
         f"https://statusinvest.com.br/acoes/{t.lower()}",
     ]
 
-    # ✅ FIX 3: usa timezone de Brasília para evitar descartar eventos do dia em UTC-3
     try:
         from zoneinfo import ZoneInfo
         hoje = datetime.now(tz=ZoneInfo("America/Sao_Paulo")).date()
@@ -343,7 +483,7 @@ def fetch_statusinvest(ticker: str) -> List[ProventoAnunciado]:
         if "JCP" in snip_upper or "JUROS SOBRE" in snip_upper:
             tipo_final = "JCP"
         elif "DIVIDENDO" in snip_upper:
-            tipo_final = "RENDIMENTO" if is_fundo else "DIVIDENDO"
+            tipo_final = "DIVIDENDO"
         elif "RENDIMENTO" in snip_upper or "PROVENTO" in snip_upper:
             tipo_final = "RENDIMENTO"
 
