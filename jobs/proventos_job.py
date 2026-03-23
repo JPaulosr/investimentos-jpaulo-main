@@ -744,6 +744,31 @@ def run() -> None:
 
     meta_map = _build_meta(_master_records)
     pos_map  = _build_pos(_mov_records)
+
+    def _build_pos_na_data(rows, data_corte_iso):
+        # Posicao de cada ticker considerando apenas movimentacoes ATE data_corte_iso
+        def _tof(v):
+            if v is None: return 0.0
+            if isinstance(v,(int,float)): return float(v)
+            st = re.sub(r"[^0-9,.-]","",str(v).strip())
+            if "," in st and "." in st: st = st.replace(".","").replace(",",".")
+            else: st = st.replace(",",".")
+            try: return float(st)
+            except: return 0.0
+        pos = {}
+        for r in rows:
+            _dt_raw = str(r.get("data") or r.get("data_operacao") or r.get("date") or "").strip()
+            _dt = _norm_date(_dt_raw)
+            if _dt and _dt > data_corte_iso:
+                continue
+            tk = _norm_ticker(r.get("ticker") or r.get("ativo") or r.get("codigo") or r.get("papel") or "")
+            if not tk: continue
+            qtd = _tof(r.get("quantidade") or r.get("qtd") or r.get("cotas") or 0)
+            tipo = r.get("tipo_operacao") or r.get("tipo") or r.get("operacao") or r.get("tipo_de_operacao")
+            if str(tipo or "").strip().upper() in {"VENDA","V","SELL","S"}: qtd *= -1.0
+            pos[tk] = pos.get(tk,0.0) + qtd
+        return {k: max(0.0,v) for k,v in pos.items()}
+
     print(f"🧩 meta_map={len(meta_map)} | pos_map={len(pos_map)} | aba_mov='{ABA_MOVIMENTACOES}'")
 
     # 🔧 Corrige linhas existentes com campos vazios (idempotente)
@@ -989,13 +1014,20 @@ def run() -> None:
         if not row_norm.get("status"):
             row_norm["status"] = "ANUNCIADO"
 
-        # quantidade_ref: sempre usa pos_map como fonte de verdade.
-        # Não confia no valor vindo da planilha/evento — pode estar corrompido
-        # (ex: VPC gravado no lugar da quantidade de cotas).
-        _qtd_ref = pos_map.get(row_norm["ticker"], 0.0)
+        # quantidade_ref: usa posicao NA DATA COM (nao a posicao atual).
+        # Ex: PETR4 tinha 60 cotas em 22/12/2025, mas hoje tem 70.
+        # O provento deve ser calculado sobre as 60 da data com.
+        _data_com_ref = row_norm.get("data_com") or ""
+        if _data_com_ref:
+            _pos_na_data = _build_pos_na_data(_mov_records, _data_com_ref)
+            _qtd_ref = _pos_na_data.get(row_norm["ticker"], 0.0)
+        else:
+            # sem data_com: fallback para posicao atual
+            _qtd_ref = pos_map.get(row_norm["ticker"], 0.0)
         if _qtd_ref and _qtd_ref > 0:
             row_norm["quantidade_ref"] = _qtd_ref
 
+        # qtd para validacao de posicao: usa pos atual (se zerou depois, nao notifica)
         qtd = float(pos_map.get(row_norm["ticker"], 0.0) or 0.0)
         posicao = {"qtd": qtd} if qtd > 0 else None
 
