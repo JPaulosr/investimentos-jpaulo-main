@@ -975,7 +975,7 @@ def run() -> None:
             "capturado_em": str(ev.get("capturado_em", "") or _now_iso_min()),
         }
 
-        if not row_norm["ticker"] or not row_norm["tipo_pagamento"] or not row_norm["data_com"]:
+        if not row_norm["ticker"] or not row_norm["tipo_pagamento"] or not row_norm["data_pagamento"]:
             continue
 
         eid = event_id_from_row(row_norm)
