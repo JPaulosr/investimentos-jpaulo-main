@@ -304,16 +304,17 @@ def _fetch_investidor10_api(ticker: str, hoje) -> List[ProventoAnunciado]:
     return resultados
 
 
-def fetch_investidor10(ticker: str) -> List[ProventoAnunciado]:
+def fetch_investidor10(ticker: str, hoje: Optional[date] = None) -> List[ProventoAnunciado]:
     t = (ticker or "").upper().strip()
     resultados: List[ProventoAnunciado] = []
 
-    # ✅ Timezone de Brasília
-    try:
-        from zoneinfo import ZoneInfo
-        hoje = datetime.now(tz=ZoneInfo("America/Sao_Paulo")).date()
-    except Exception:
-        hoje = datetime.now().date()
+    # ✅ Timezone de Brasília — usa hoje passado externamente (ex: HOJE_OVERRIDE) ou data real
+    if hoje is None:
+        try:
+            from zoneinfo import ZoneInfo
+            hoje = datetime.now(tz=ZoneInfo("America/Sao_Paulo")).date()
+        except Exception:
+            hoje = datetime.now().date()
 
     # ══════════════════════════════════════════════════════════════════════════
     # PASSO 1: tenta API JSON (valores com 8 casas decimais, sem arredondamento)
@@ -425,7 +426,7 @@ def fetch_investidor10(ticker: str) -> List[ProventoAnunciado]:
     return resultados
 
 
-def fetch_statusinvest(ticker: str) -> List[ProventoAnunciado]:
+def fetch_statusinvest(ticker: str, hoje: Optional[date] = None) -> List[ProventoAnunciado]:
     t = (ticker or "").upper().strip()
     resultados: List[ProventoAnunciado] = []
 
@@ -435,11 +436,13 @@ def fetch_statusinvest(ticker: str) -> List[ProventoAnunciado]:
         f"https://statusinvest.com.br/acoes/{t.lower()}",
     ]
 
-    try:
-        from zoneinfo import ZoneInfo
-        hoje = datetime.now(tz=ZoneInfo("America/Sao_Paulo")).date()
-    except Exception:
-        hoje = datetime.now().date()
+    # usa hoje passado externamente (ex: HOJE_OVERRIDE) ou data real
+    if hoje is None:
+        try:
+            from zoneinfo import ZoneInfo
+            hoje = datetime.now(tz=ZoneInfo("America/Sao_Paulo")).date()
+        except Exception:
+            hoje = datetime.now().date()
 
     for url in urls_to_try:
 
@@ -515,6 +518,17 @@ def fetch_provento_anunciado(ticker: str, logs: Optional[List[str]] = None) -> L
     if not t:
         return []
 
+    # ── MODO TESTE: respeita HOJE_OVERRIDE do job ────────────────────────────
+    import os as _os
+    _hoje_ref: Optional[date] = None
+    _override = (_os.getenv("HOJE_OVERRIDE") or "").strip()
+    if _override:
+        try:
+            _hoje_ref = datetime.strptime(_override, "%Y-%m-%d").date()
+        except ValueError:
+            pass
+    # ────────────────────────────────────────────────────────────────────────
+
     sources = [
         ("INVESTIDOR10", fetch_investidor10),
         ("STATUSINVEST", fetch_statusinvest),
@@ -523,7 +537,7 @@ def fetch_provento_anunciado(ticker: str, logs: Optional[List[str]] = None) -> L
     for name, fn in sources:
         try:
             log(f"🔎 Consultando {name}...")
-            lista_provs = fn(t)
+            lista_provs = fn(t, hoje=_hoje_ref) if _hoje_ref else fn(t)
 
             if lista_provs:
                 output = [p.to_row() for p in lista_provs]
