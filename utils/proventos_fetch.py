@@ -255,9 +255,19 @@ def _fetch_investidor10_api(ticker: str, hoje) -> List[ProventoAnunciado]:
         dc = _parse_date_iso(str(dc_raw)) if dc_raw else None
         dp = _parse_date_iso(str(dp_raw)) if dp_raw else None
 
-        # Só registros com data de pagamento futura (ou hoje)
+        # Só registros com data de pagamento futura (ou dentro da janela retroativa)
+        # JANELA_RETROATIVA_DIAS=7 → aceita pagamentos dos últimos 7 dias (modo teste)
+        # JANELA_RETROATIVA_DIAS=0 → comportamento padrão (só futuro)
+        import os as _os_inner
+        _retro_dias = 0
+        try:
+            _retro_dias = int(_os_inner.getenv("JANELA_RETROATIVA_DIAS", "0"))
+        except (ValueError, TypeError):
+            _retro_dias = 0
+        from datetime import timedelta as _td
+        _data_minima = hoje - _td(days=_retro_dias)
         dp_obj = _get_date_obj(dp) if dp else None
-        if not (dp_obj and dp_obj >= hoje):
+        if not (dp_obj and dp_obj >= _data_minima):
             continue
 
         # Converte valor para float (já vem com ponto decimal da API)
@@ -347,9 +357,9 @@ def fetch_investidor10(ticker: str, hoje: Optional[date] = None) -> List[Provent
             r"(Dividendos?|Rendimentos?|Rend\.?\s*Trib\.?|JSCP|JCP)\s*"
             r"(\d{2}/\d{2}/\d{4})\s*"        # data_com
             r"(\d{2}/\d{2}/\d{4})\s*"        # data_pagamento
-            r"(\d+[.,]\d+)"                    # valor (bruto ou liq dependendo do layout)
-            r"(?:\s+(\d+[.,]\d+))?"           # segundo valor (opcional)
-            r"(?:\s+(\d+[.,]\d+))?",          # terceiro valor (opcional)
+            r"(\d+[.,]\d{1,8})"               # valor — até 8 casas decimais
+            r"(?:\s+(\d+[.,]\d{1,8}))?"       # segundo valor (opcional)
+            r"(?:\s+(\d+[.,]\d{1,8}))?",      # terceiro valor (opcional)
             re.IGNORECASE,
         )
         matches = pattern.findall(text)
@@ -385,7 +395,16 @@ def fetch_investidor10(ticker: str, hoje: Optional[date] = None) -> List[Provent
             dp = _parse_date_iso(dp_raw)
 
             dp_obj = _get_date_obj(dp) if dp else None
-            if not (dp_obj and dp_obj >= hoje):
+            # Janela retroativa: JANELA_RETROATIVA_DIAS=7 aceita pagamentos dos últimos 7 dias
+            import os as _os_html
+            _retro_html = 0
+            try:
+                _retro_html = int(_os_html.getenv("JANELA_RETROATIVA_DIAS", "0"))
+            except (ValueError, TypeError):
+                _retro_html = 0
+            from datetime import timedelta as _td_html
+            _data_min_html = hoje - _td_html(days=_retro_html)
+            if not (dp_obj and dp_obj >= _data_min_html):
                 continue
 
             tipo_upper = (tipo_raw or "").upper().strip()
@@ -491,7 +510,16 @@ def fetch_statusinvest(ticker: str, hoje: Optional[date] = None) -> List[Provent
             tipo_final = "RENDIMENTO"
 
         dp_obj = _get_date_obj(data_pag) if data_pag else None
-        if dp_obj and dp_obj >= hoje:
+        # Janela retroativa: JANELA_RETROATIVA_DIAS=7 aceita pagamentos dos últimos 7 dias
+        import os as _os_si
+        _retro_si = 0
+        try:
+            _retro_si = int(_os_si.getenv("JANELA_RETROATIVA_DIAS", "0"))
+        except (ValueError, TypeError):
+            _retro_si = 0
+        from datetime import timedelta as _td_si
+        _data_min_si = hoje - _td_si(days=_retro_si)
+        if dp_obj and dp_obj >= _data_min_si:
             if val and _valor_parece_valido(val) and data_pag:
                 prov = ProventoAnunciado(
                     ticker=t,
