@@ -29,5 +29,6 @@ jobs:
           SHEET_ID_NOVO: ${{ secrets.SHEET_ID_NOVO }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          JANELA_RETROATIVA_DIAS: ${{ vars.JANELA_RETROATIVA_DIAS }}
         run: |
           python jobs/proventos_job.py
