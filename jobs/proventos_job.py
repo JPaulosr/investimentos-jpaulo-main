@@ -112,7 +112,7 @@ def _now_sp() -> datetime:
     return datetime.now(tz=TZ_SP)
 
 def _today_sp_iso() -> str:
-    return _now_sp().strftime("%Y-%m-%d")
+    return _now_sp().strftime("%Y/%m/%d")
 
 def _now_iso_min() -> str:
     return _now_sp().strftime("%Y-%m-%d %H:%M")
@@ -128,7 +128,7 @@ def _norm_date(s: Any) -> str:
         return ""
     if hasattr(s, "strftime"):
         try:
-            return s.strftime("%Y-%m-%d")
+            return s.strftime("%Y/%m/%d")
         except Exception:
             return ""
     st = str(s).strip()
@@ -136,12 +136,12 @@ def _norm_date(s: Any) -> str:
         return ""
     for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d"):
         try:
-            return datetime.strptime(st, fmt).strftime("%Y-%m-%d")
+            return datetime.strptime(st, fmt).strftime("%Y/%m/%d")
         except Exception:
             continue
     try:
         dt = datetime.fromisoformat(st.replace("Z", "").split(".")[0])
-        return dt.strftime("%Y-%m-%d")
+        return dt.strftime("%Y/%m/%d")
     except Exception:
         return ""
 
@@ -201,7 +201,7 @@ def _fmt_date_br(iso_yyyy_mm_dd: str) -> str:
     if not d:
         return s
     try:
-        return datetime.strptime(d, "%Y-%m-%d").strftime("%d/%m/%Y")
+        return datetime.strptime(d, "%Y/%m/%d").strftime("%d/%m/%Y")
     except Exception:
         return s
 
@@ -213,7 +213,7 @@ def _fmt_ddmm(iso_yyyy_mm_dd: str) -> str:
     if not d:
         return ""
     try:
-        return datetime.strptime(d, "%Y-%m-%d").strftime("%d/%m")
+        return datetime.strptime(d, "%Y/%m/%d").strftime("%d/%m")
     except Exception:
         return ""
 
@@ -814,7 +814,7 @@ def run() -> None:
     # =============================================================================
     hoje_iso = _today_sp_iso()
     from datetime import timedelta
-    _limite_delete = (datetime.now(tz=TZ_SP) - timedelta(days=30)).strftime("%Y-%m-%d")
+    _limite_delete = (datetime.now(tz=TZ_SP) - timedelta(days=30)).strftime("%Y/%m/%d")
     idx_dp_col = hmap.get("data_pagamento")
     softdelete_updates: List[Dict[str, Any]] = []
     if idx_dp_col:
@@ -1232,7 +1232,7 @@ def run() -> None:
             ws_anun.append_rows(append_rows[i:i + CHUNK], value_input_option="RAW")
 
     if cell_updates:
-        ws_anun.batch_update(cell_updates)
+        ws_anun.batch_update(cell_updates, value_input_option="RAW")
 
     if log_rows:
         CHUNK = 50
