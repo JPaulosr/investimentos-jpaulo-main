@@ -112,7 +112,7 @@ def _now_sp() -> datetime:
     return datetime.now(tz=TZ_SP)
 
 def _today_sp_iso() -> str:
-    return _now_sp().strftime("%Y/%m/%d")
+    return _now_sp().strftime("%d/%m/%Y")
 
 def _now_iso_min() -> str:
     return _now_sp().strftime("%Y-%m-%d %H:%M")
@@ -128,7 +128,7 @@ def _norm_date(s: Any) -> str:
         return ""
     if hasattr(s, "strftime"):
         try:
-            return s.strftime("%Y/%m/%d")
+            return s.strftime("%d/%m/%Y")
         except Exception:
             return ""
     st = str(s).strip()
@@ -136,12 +136,12 @@ def _norm_date(s: Any) -> str:
         return ""
     for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d"):
         try:
-            return datetime.strptime(st, fmt).strftime("%Y/%m/%d")
+            return datetime.strptime(st, fmt).strftime("%d/%m/%Y")
         except Exception:
             continue
     try:
         dt = datetime.fromisoformat(st.replace("Z", "").split(".")[0])
-        return dt.strftime("%Y/%m/%d")
+        return dt.strftime("%d/%m/%Y")
     except Exception:
         return ""
 
@@ -201,7 +201,7 @@ def _fmt_date_br(iso_yyyy_mm_dd: str) -> str:
     if not d:
         return s
     try:
-        return datetime.strptime(d, "%Y/%m/%d").strftime("%d/%m/%Y")
+        return datetime.strptime(d, "%d/%m/%Y").strftime("%d/%m/%Y")
     except Exception:
         return s
 
@@ -213,7 +213,7 @@ def _fmt_ddmm(iso_yyyy_mm_dd: str) -> str:
     if not d:
         return ""
     try:
-        return datetime.strptime(d, "%Y/%m/%d").strftime("%d/%m")
+        return datetime.strptime(d, "%d/%m/%Y").strftime("%d/%m")
     except Exception:
         return ""
 
@@ -814,7 +814,7 @@ def run() -> None:
     # =============================================================================
     hoje_iso = _today_sp_iso()
     from datetime import timedelta
-    _limite_delete = (datetime.now(tz=TZ_SP) - timedelta(days=30)).strftime("%Y/%m/%d")
+    _limite_delete_dt = datetime.now(tz=TZ_SP).date() - timedelta(days=30)
     idx_dp_col = hmap.get("data_pagamento")
     softdelete_updates: List[Dict[str, Any]] = []
     if idx_dp_col:
@@ -824,12 +824,17 @@ def run() -> None:
             if ativo_val in ("0", "False", "false"):
                 continue
             dp_raw = str(row[idx_dp_col - 1]).strip() if (idx_dp_col - 1) < len(row) else ""
-            dp = _norm_date(dp_raw)
-            if dp and dp < _limite_delete:
-                softdelete_updates.append({"range": _cell_a1(hmap["ativo"], ridx), "values": [[0]]})
-                eid_row = str(row[idx_event_id - 1]).strip() if (idx_event_id - 1) < len(row) else ""
-                if eid_row:
-                    existing_ativo[eid_row] = "0"
+            dp_str = _norm_date(dp_raw)
+            if dp_str:
+                try:
+                    dp_dt = datetime.strptime(dp_str, "%d/%m/%Y").date()
+                    if dp_dt < _limite_delete_dt:
+                        softdelete_updates.append({"range": _cell_a1(hmap["ativo"], ridx), "values": [[0]]})
+                        eid_row = str(row[idx_event_id - 1]).strip() if (idx_event_id - 1) < len(row) else ""
+                        if eid_row:
+                            existing_ativo[eid_row] = "0"
+                except Exception:
+                    pass
         if softdelete_updates:
             ws_anun.batch_update(softdelete_updates)
             print(f"🗑️ Soft-delete proativo: {len(softdelete_updates)} linhas com data_pagamento > 30 dias marcadas como ativo=0")
@@ -1070,8 +1075,8 @@ def run() -> None:
                 ticker=row_norm["ticker"],
                 evento={
                     "tipo_pagamento": row_norm.get("tipo_pagamento"),
-                    "data_com": row_norm.get("data_com"),
-                    "data_pagamento": row_norm.get("data_pagamento"),
+                    "data_com":       _fmt_date_br(row_norm.get("data_com", "")),
+                    "data_pagamento": _fmt_date_br(row_norm.get("data_pagamento", "")),
                     "valor_por_cota": row_norm.get("valor_por_cota"),
                 },
                 meta=meta,
@@ -1147,8 +1152,8 @@ def run() -> None:
             ticker=row_norm["ticker"],
             evento={
                 "tipo_pagamento": row_norm.get("tipo_pagamento"),
-                "data_com": row_norm.get("data_com"),
-                "data_pagamento": row_norm.get("data_pagamento"),
+                "data_com":       _fmt_date_br(row_norm.get("data_com", "")),
+                "data_pagamento": _fmt_date_br(row_norm.get("data_pagamento", "")),
                 "valor_por_cota": row_norm.get("valor_por_cota"),
             },
             meta=meta,
