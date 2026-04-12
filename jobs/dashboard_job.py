@@ -353,116 +353,6 @@ def _dividendos_mensais(df_prov: pd.DataFrame) -> dict:
 
 
 # ── MAIN ───────────────────────────────────────────────────────────────────────
-def main() -> None:
-    if not SHEET_ID:
-        print("❌ SHEET_ID não encontrado.")
-        sys.exit(1)
-
-    print("🔌 Conectando ao Sheets...")
-    gc = _gc()
-    sh = gc.open_by_key(SHEET_ID)
-    hoje = date.today()
-
-    # ── 1. Carregar dados ──────────────────────────────────────────────────────
-    print("📥 Lendo dados do Sheets...")
-    df_rf   = _read(sh, ABA_RF)
-    df_rv   = _read(sh, ABA_RV)
-    df_prov = _read(sh, ABA_PROVENTOS)
-    df_bcb  = _carregar_bcb_cache(sh)
-
-    if df_bcb.empty:
-        print("  ⚠ bcb_cache vazio — usando API do BCB direto (mais lento)")
-    else:
-        print(f"  ✅ bcb_cache: {len(df_bcb)} registros")
-
-    # ── 2. Renda Fixa ──────────────────────────────────────────────────────────
-    print("🏦 Calculando Renda Fixa...")
-    titulos_rf = df_rf.to_dict("records") if not df_rf.empty else []
-    rf_ap = rf_bruto = rf_liq = rf_ir = 0.0
-    qtd_ativos = 0
-
-    for t in titulos_rf:
-        c = _calcular_titulo(t, df_bcb, hoje)
-        if c and not c["vencido"]:
-            rf_ap    += c["valor_aplicado"]
-            rf_bruto += c["valor_bruto"]
-            rf_liq   += c["valor_liquido"]
-            rf_ir    += c["ir_valor"]
-            qtd_ativos += 1
-
-    rf_rend_liq = rf_liq - rf_ap
-    rf_rend_pct = (rf_liq / rf_ap - 1) * 100 if rf_ap else 0.0
-
-    print(f"  ✅ RF: {qtd_ativos} títulos | aplicado={rf_ap:.2f} | líquido={rf_liq:.2f}")
-
-    # ── 3. Renda Variável (carteira_snapshot) ─────────────────────────────────
-    print("📈 Calculando Renda Variável...")
-    rv_investido = rv_atual = rv_div12m = 0.0
-
-    if not df_rv.empty:
-        df_rv.columns = [str(c).strip().lower() for c in df_rv.columns]
-
-        # custo total
-        col_pm  = next((c for c in df_rv.columns if "preco_medio" in c or "pm" in c), None)
-        col_qtd = next((c for c in df_rv.columns if "quantidade" in c or "qtd" in c), None)
-        col_cur = next((c for c in df_rv.columns if "preco_atual" in c or "cotacao" in c or "valor_atual" in c), None)
-        col_div = next((c for c in df_rv.columns if "dividendo" in c or "proventos_12m" in c or "renda_12m" in c), None)
-
-        for _, row in df_rv.iterrows():
-            qtd = _to_float(row.get(col_qtd, 0)) if col_qtd else 0
-            pm  = _to_float(row.get(col_pm, 0))  if col_pm  else 0
-            cur = _to_float(row.get(col_cur, 0)) if col_cur else 0
-            div = _to_float(row.get(col_div, 0)) if col_div else 0
-            rv_investido += qtd * pm
-            rv_atual     += qtd * cur if cur else qtd * pm
-            rv_div12m    += div
-
-    rv_lucro     = rv_atual - rv_investido
-    rv_lucro_pct = (rv_atual / rv_investido - 1) * 100 if rv_investido else 0.0
-
-    print(f"  ✅ RV: investido={rv_investido:.2f} | atual={rv_atual:.2f} | div12m={rv_div12m:.2f}")
-
-    # ── 4. Consolidado ────────────────────────────────────────────────────────
-    total_inv   = rf_ap + rv_investido
-    total_atual = rf_liq + rv_atual
-    total_lucro = total_atual - total_inv
-    total_pct   = (total_atual / total_inv - 1) * 100 if total_inv else 0.0
-
-    # ── 5. Séries mensais ─────────────────────────────────────────────────────
-    print("📅 Calculando séries mensais (12 meses)...")
-    mensal_juros, mensal_ir = _rendimento_mensal_rf(titulos_rf, df_bcb)
-    mensal_div              = _dividendos_mensais(df_prov)
-
-    # ── 6. Salvar snapshot ────────────────────────────────────────────────────
-    print("💾 Salvando dashboard_snapshot...")
-    agora = datetime.now().strftime("%Y-%m-%d %H:%M")
-    linha = [
-        round(rf_ap, 2), round(rf_bruto, 2), round(rf_liq, 2),
-        round(rf_rend_liq, 2), round(rf_rend_pct, 4), round(rf_ir, 2), qtd_ativos,
-        round(rv_investido, 2), round(rv_atual, 2), round(rv_lucro, 2),
-        round(rv_lucro_pct, 4), round(rv_div12m, 2),
-        round(total_inv, 2), round(total_atual, 2), round(total_lucro, 2), round(total_pct, 4),
-        json.dumps(mensal_juros),
-        json.dumps(mensal_div),
-        json.dumps(mensal_ir),
-        agora,
-    ]
-
-    ws = _ws(sh, ABA_SNAPSHOT, rows=10, cols=len(HEADER_SNAPSHOT))
-    ws.clear()
-    ws.update([HEADER_SNAPSHOT, linha], "A1", value_input_option="USER_ENTERED")
-
-    print(f"\n✅ dashboard_snapshot salvo às {agora}")
-    print(f"   RF  aplicado={rf_ap:,.2f} | líquido={rf_liq:,.2f} | IR={rf_ir:,.2f}")
-    print(f"   RV  investido={rv_investido:,.2f} | atual={rv_atual:,.2f}")
-    print(f"   TOT investido={total_inv:,.2f} | atual={total_atual:,.2f} | lucro={total_lucro:,.2f}")
-
-    # ── 7. Alertas de vencimento RF ───────────────────────────────────────────
-    verificar_vencimentos(titulos_rf, df_bcb)
-
-
-if __name__ == "__main__":
-    main()
 
 
 # =============================================================================
@@ -600,3 +490,115 @@ def verificar_vencimentos(titulos: list, df_bcb: pd.DataFrame) -> None:
         print("  ✅ Nenhum título vencendo hoje ou nos próximos 7 dias.")
     else:
         print(f"  📨 {enviados} alerta(s) de vencimento enviado(s).")
+
+
+def main() -> None:
+    if not SHEET_ID:
+        print("❌ SHEET_ID não encontrado.")
+        sys.exit(1)
+
+    print("🔌 Conectando ao Sheets...")
+    gc = _gc()
+    sh = gc.open_by_key(SHEET_ID)
+    hoje = date.today()
+
+    # ── 1. Carregar dados ──────────────────────────────────────────────────────
+    print("📥 Lendo dados do Sheets...")
+    df_rf   = _read(sh, ABA_RF)
+    df_rv   = _read(sh, ABA_RV)
+    df_prov = _read(sh, ABA_PROVENTOS)
+    df_bcb  = _carregar_bcb_cache(sh)
+
+    if df_bcb.empty:
+        print("  ⚠ bcb_cache vazio — usando API do BCB direto (mais lento)")
+    else:
+        print(f"  ✅ bcb_cache: {len(df_bcb)} registros")
+
+    # ── 2. Renda Fixa ──────────────────────────────────────────────────────────
+    print("🏦 Calculando Renda Fixa...")
+    titulos_rf = df_rf.to_dict("records") if not df_rf.empty else []
+    rf_ap = rf_bruto = rf_liq = rf_ir = 0.0
+    qtd_ativos = 0
+
+    for t in titulos_rf:
+        c = _calcular_titulo(t, df_bcb, hoje)
+        if c and not c["vencido"]:
+            rf_ap    += c["valor_aplicado"]
+            rf_bruto += c["valor_bruto"]
+            rf_liq   += c["valor_liquido"]
+            rf_ir    += c["ir_valor"]
+            qtd_ativos += 1
+
+    rf_rend_liq = rf_liq - rf_ap
+    rf_rend_pct = (rf_liq / rf_ap - 1) * 100 if rf_ap else 0.0
+
+    print(f"  ✅ RF: {qtd_ativos} títulos | aplicado={rf_ap:.2f} | líquido={rf_liq:.2f}")
+
+    # ── 3. Renda Variável (carteira_snapshot) ─────────────────────────────────
+    print("📈 Calculando Renda Variável...")
+    rv_investido = rv_atual = rv_div12m = 0.0
+
+    if not df_rv.empty:
+        df_rv.columns = [str(c).strip().lower() for c in df_rv.columns]
+
+        # custo total
+        col_pm  = next((c for c in df_rv.columns if "preco_medio" in c or "pm" in c), None)
+        col_qtd = next((c for c in df_rv.columns if "quantidade" in c or "qtd" in c), None)
+        col_cur = next((c for c in df_rv.columns if "preco_atual" in c or "cotacao" in c or "valor_atual" in c), None)
+        col_div = next((c for c in df_rv.columns if "dividendo" in c or "proventos_12m" in c or "renda_12m" in c), None)
+
+        for _, row in df_rv.iterrows():
+            qtd = _to_float(row.get(col_qtd, 0)) if col_qtd else 0
+            pm  = _to_float(row.get(col_pm, 0))  if col_pm  else 0
+            cur = _to_float(row.get(col_cur, 0)) if col_cur else 0
+            div = _to_float(row.get(col_div, 0)) if col_div else 0
+            rv_investido += qtd * pm
+            rv_atual     += qtd * cur if cur else qtd * pm
+            rv_div12m    += div
+
+    rv_lucro     = rv_atual - rv_investido
+    rv_lucro_pct = (rv_atual / rv_investido - 1) * 100 if rv_investido else 0.0
+
+    print(f"  ✅ RV: investido={rv_investido:.2f} | atual={rv_atual:.2f} | div12m={rv_div12m:.2f}")
+
+    # ── 4. Consolidado ────────────────────────────────────────────────────────
+    total_inv   = rf_ap + rv_investido
+    total_atual = rf_liq + rv_atual
+    total_lucro = total_atual - total_inv
+    total_pct   = (total_atual / total_inv - 1) * 100 if total_inv else 0.0
+
+    # ── 5. Séries mensais ─────────────────────────────────────────────────────
+    print("📅 Calculando séries mensais (12 meses)...")
+    mensal_juros, mensal_ir = _rendimento_mensal_rf(titulos_rf, df_bcb)
+    mensal_div              = _dividendos_mensais(df_prov)
+
+    # ── 6. Salvar snapshot ────────────────────────────────────────────────────
+    print("💾 Salvando dashboard_snapshot...")
+    agora = datetime.now().strftime("%Y-%m-%d %H:%M")
+    linha = [
+        round(rf_ap, 2), round(rf_bruto, 2), round(rf_liq, 2),
+        round(rf_rend_liq, 2), round(rf_rend_pct, 4), round(rf_ir, 2), qtd_ativos,
+        round(rv_investido, 2), round(rv_atual, 2), round(rv_lucro, 2),
+        round(rv_lucro_pct, 4), round(rv_div12m, 2),
+        round(total_inv, 2), round(total_atual, 2), round(total_lucro, 2), round(total_pct, 4),
+        json.dumps(mensal_juros),
+        json.dumps(mensal_div),
+        json.dumps(mensal_ir),
+        agora,
+    ]
+
+    ws = _ws(sh, ABA_SNAPSHOT, rows=10, cols=len(HEADER_SNAPSHOT))
+    ws.clear()
+    ws.update([HEADER_SNAPSHOT, linha], "A1", value_input_option="USER_ENTERED")
+
+    print(f"\n✅ dashboard_snapshot salvo às {agora}")
+    print(f"   RF  aplicado={rf_ap:,.2f} | líquido={rf_liq:,.2f} | IR={rf_ir:,.2f}")
+    print(f"   RV  investido={rv_investido:,.2f} | atual={rv_atual:,.2f}")
+    print(f"   TOT investido={total_inv:,.2f} | atual={total_atual:,.2f} | lucro={total_lucro:,.2f}")
+
+    # ── 7. Alertas de vencimento RF ───────────────────────────────────────────
+    verificar_vencimentos(titulos_rf, df_bcb)
+
+
+if __name__ == "__main__":
+    main()
