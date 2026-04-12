@@ -31,8 +31,8 @@ jobs:
       - name: 1. BCB Cache (taxas CDI/Selic/IPCA)
         if: ${{ github.event.inputs.job == 'all' || github.event.inputs.job == 'bcb' || github.event_name == 'schedule' }}
         env:
-          GCP_SERVICE_ACCOUNT:  ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
-          SHEET_ID_NOVO:        ${{ secrets.SHEET_ID_NOVO }}
+          GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
+          SHEET_ID_NOVO:            ${{ secrets.SHEET_ID_NOVO }}
         run: |
           python jobs/bcb_job.py
 
