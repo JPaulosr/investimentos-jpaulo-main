@@ -1,13 +1,18 @@
-name: Robô Proventos (Diário 12h)
+name: Robô Proventos + Dashboard + BCB (Diário)
 
 on:
   schedule:
     # 15:00 UTC = 12:00 Brasil
     - cron: "0 15 * * *"
   workflow_dispatch:
+    inputs:
+      job:
+        description: "Qual job rodar (all | proventos | dashboard | bcb)"
+        required: false
+        default: "all"
 
 jobs:
-  run-robot:
+  run-jobs:
     runs-on: ubuntu-latest
 
     steps:
@@ -23,12 +28,31 @@ jobs:
         run: |
           pip install requests pandas gspread google-auth beautifulsoup4 yfinance
 
-      - name: Executar Robô
+      - name: 1. BCB Cache (taxas CDI/Selic/IPCA)
+        if: ${{ github.event.inputs.job == 'all' || github.event.inputs.job == 'bcb' || github.event_name == 'schedule' }}
+        env:
+          GCP_SERVICE_ACCOUNT:  ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
+          SHEET_ID_NOVO:        ${{ secrets.SHEET_ID_NOVO }}
+        run: |
+          python jobs/bcb_job.py
+
+      - name: 2. Robô Proventos
+        if: ${{ github.event.inputs.job == 'all' || github.event.inputs.job == 'proventos' || github.event_name == 'schedule' }}
         env:
           GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
-          SHEET_ID_NOVO: ${{ secrets.SHEET_ID_NOVO }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          JANELA_RETROATIVA_DIAS: ${{ vars.JANELA_RETROATIVA_DIAS }}
+          SHEET_ID_NOVO:            ${{ secrets.SHEET_ID_NOVO }}
+          TELEGRAM_BOT_TOKEN:       ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:         ${{ secrets.TELEGRAM_CHAT_ID }}
+          JANELA_RETROATIVA_DIAS:   ${{ vars.JANELA_RETROATIVA_DIAS }}
         run: |
           python jobs/proventos_job.py
+
+      - name: 3. Dashboard Snapshot (RF + RV consolidado)
+        if: ${{ github.event.inputs.job == 'all' || github.event.inputs.job == 'dashboard' || github.event_name == 'schedule' }}
+        env:
+          GCP_SERVICE_ACCOUNT:   ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
+          SHEET_ID_NOVO:         ${{ secrets.SHEET_ID_NOVO }}
+          TELEGRAM_BOT_TOKEN:    ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:      ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python jobs/dashboard_job.py
