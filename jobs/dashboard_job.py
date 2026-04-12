@@ -458,7 +458,11 @@ def verificar_vencimentos(titulos: list, df_bcb: pd.DataFrame) -> None:
     Roda dentro do dashboard_job — já tem acesso a titulos e df_bcb.
     """
     print("\n🔔 Verificando vencimentos...")
-    hoje = date.today()
+    # Usa horário de Brasília (UTC-3) para evitar discrepância com o Actions (UTC)
+    from datetime import timezone, timedelta as _td
+    _brt = timezone(_td(hours=-3))
+    hoje = datetime.now(tz=_brt).date()
+    print(f"  📅 Data BRT: {hoje}")
     enviados = 0
 
     for t in titulos:
