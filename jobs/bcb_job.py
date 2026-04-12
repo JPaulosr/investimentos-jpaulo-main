@@ -135,9 +135,16 @@ def _salvar(ws: gspread.Worksheet, df_novo: pd.DataFrame) -> None:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> None:
-    sheet_id = os.environ.get("SHEET_ID_NOVO") or os.environ.get("SHEET_ID")
+    sheet_id = (os.environ.get("SHEET_ID_NOVO") or os.environ.get("SHEET_ID") or "").strip()
+    print(f"🔑 SHEET_ID lido: '{sheet_id[:8]}...{sheet_id[-4:]}' ({len(sheet_id)} chars)" if len(sheet_id) > 12 else f"🔑 SHEET_ID lido: '{sheet_id}' ({len(sheet_id)} chars)")
+
+    # Valida formato básico do Sheet ID (44 chars alfanuméricos + hífen/underscore)
+    import re as _re
     if not sheet_id:
-        print("❌ SHEET_ID não encontrado. Defina SHEET_ID_NOVO ou SHEET_ID no ambiente.")
+        print("❌ SHEET_ID vazio — verifique o secret SHEET_ID_NOVO no GitHub.")
+        sys.exit(1)
+    if not _re.match(r'^[a-zA-Z0-9_\-]{20,}$', sheet_id):
+        print(f"❌ SHEET_ID com formato inválido: '{sheet_id}'")
         sys.exit(1)
 
     data_ini = _ini_hist()
