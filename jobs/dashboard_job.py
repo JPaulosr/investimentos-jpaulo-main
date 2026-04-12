@@ -450,7 +450,7 @@ def main() -> None:
 
     ws = _ws(sh, ABA_SNAPSHOT, rows=10, cols=len(HEADER_SNAPSHOT))
     ws.clear()
-    ws.update("A1", [HEADER_SNAPSHOT, linha], value_input_option="USER_ENTERED")
+    ws.update([HEADER_SNAPSHOT, linha], "A1", value_input_option="USER_ENTERED")
 
     print(f"\n✅ dashboard_snapshot salvo às {agora}")
     print(f"   RF  aplicado={rf_ap:,.2f} | líquido={rf_liq:,.2f} | IR={rf_ir:,.2f}")
