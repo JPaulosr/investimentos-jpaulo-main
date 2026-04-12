@@ -57,6 +57,9 @@ HEADER_SNAPSHOT = [
     "mensal_rf_juros",       # JSON: {"2025-03": 150.20, "2025-04": 163.10, ...}
     "mensal_rv_dividendos",  # JSON: {"2025-03": 320.00, "2025-04": 280.50, ...}
     "mensal_rf_ir",          # JSON: {"2025-03": 30.00, ...}
+    # Alocação por classe e evolução mensal (JSON)
+    "alocacao_classes",
+    "evolucao_patrimonio",
     # Meta
     "atualizado_em",
 ]
@@ -496,6 +499,59 @@ def verificar_vencimentos(titulos: list, df_bcb: pd.DataFrame) -> None:
         print(f"  📨 {enviados} alerta(s) de vencimento enviado(s).")
 
 
+def _alocacao_por_classe(df_rv: pd.DataFrame, rf_liq: float) -> dict:
+    alocacao = {}
+    if not df_rv.empty:
+        df = df_rv.copy()
+        df.columns = [str(c).strip().lower() for c in df.columns]
+        col_cls = next((c for c in df.columns if "classe" in c), None)
+        col_val = next((c for c in df.columns if "valor_mercado" in c), None)
+        if col_cls and col_val:
+            df["_val"] = df[col_val].apply(_to_float)
+            for cls, grp in df.groupby(col_cls):
+                alocacao[str(cls)] = round(grp["_val"].sum(), 2)
+    if rf_liq > 0:
+        alocacao["Renda Fixa"] = round(rf_liq, 2)
+    return alocacao
+
+
+def _evolucao_patrimonio(df_mov: pd.DataFrame, rv_atual_total: float, rf_liq: float) -> dict:
+    if df_mov.empty:
+        return {}
+    df = df_mov.copy()
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    col_data = next((c for c in df.columns if c == "data"), None)
+    col_tipo = next((c for c in df.columns if "tipo" in c), None)
+    col_val  = next((c for c in df.columns if "valor_total" in c), None)
+    if not col_data or not col_val:
+        return {}
+    df["_data"] = df[col_data].apply(_parse_date)
+    df["_val"]  = df[col_val].apply(_to_float)
+    df["_tipo"] = df[col_tipo].astype(str).str.strip().str.upper() if col_tipo else "COMPRA"
+    df = df.dropna(subset=["_data"])
+    hoje = date.today()
+    evolucao = {}
+    for i in range(12, -1, -1):
+        m = hoje.month - i
+        y = hoje.year
+        while m <= 0:
+            m += 12
+            y -= 1
+        if m == 12:
+            prox = date(y+1, 1, 1)
+        else:
+            prox = date(y, m+1, 1)
+        mes_fim = prox - timedelta(days=1)
+        chave = date(y, m, 1).strftime("%Y-%m")
+        df_ate   = df[df["_data"] <= mes_fim]
+        compras  = df_ate[df_ate["_tipo"].isin(["COMPRA","C","BUY"])]["_val"].sum()
+        vendas   = df_ate[df_ate["_tipo"].isin(["VENDA","V","SELL"])]["_val"].sum()
+        investido = max(0.0, compras - vendas)
+        atual = (rv_atual_total + rf_liq) if i == 0 else investido
+        evolucao[chave] = {"investido": round(investido, 2), "atual": round(atual, 2)}
+    return evolucao
+
+
 def main() -> None:
     if not SHEET_ID:
         print("❌ SHEET_ID não encontrado.")
@@ -560,23 +616,41 @@ def main() -> None:
             rv_atual     += qtd * cur if cur else qtd * pm
             rv_div12m    += div
 
-    rv_lucro     = rv_atual - rv_investido
-    rv_lucro_pct = (rv_atual / rv_investido - 1) * 100 if rv_investido else 0.0
+    # Total de dividendos recebidos (todos, não só 12m) — entra no lucro real
+    rv_div_total = 0.0
+    if not df_prov.empty:
+        df_prov.columns = [str(c).strip().lower() for c in df_prov.columns]
+        col_val_prov = next((c for c in df_prov.columns if c == "valor"), None)
+        if col_val_prov:
+            rv_div_total = df_prov[col_val_prov].apply(_to_float).sum()
 
-    print(f"  ✅ RV: investido={rv_investido:.2f} | atual={rv_atual:.2f} | div12m={rv_div12m:.2f}")
+    # Lucro RV = ganho de capital + todos os dividendos recebidos
+    rv_ganho_capital = rv_atual - rv_investido
+    rv_lucro         = rv_ganho_capital + rv_div_total
+    rv_lucro_pct     = (rv_lucro / rv_investido * 100) if rv_investido else 0.0
+
+    print(f"  ✅ RV: investido={rv_investido:.2f} | atual={rv_atual:.2f} | div12m={rv_div12m:.2f} | div_total={rv_div_total:.2f}")
 
     # ── 4. Consolidado ────────────────────────────────────────────────────────
     total_inv   = rf_ap + rv_investido
     total_atual = rf_liq + rv_atual
-    total_lucro = total_atual - total_inv
-    total_pct   = (total_atual / total_inv - 1) * 100 if total_inv else 0.0
+    # Lucro total = valorização (RF+RV) + todos os dividendos recebidos
+    total_lucro = (total_atual - total_inv) + rv_div_total
+    total_pct   = (total_lucro / total_inv * 100) if total_inv else 0.0
 
     # ── 5. Séries mensais ─────────────────────────────────────────────────────
     print("📅 Calculando séries mensais (12 meses)...")
     mensal_juros, mensal_ir = _rendimento_mensal_rf(titulos_rf, df_bcb)
     mensal_div              = _dividendos_mensais(df_prov)
 
-    # ── 6. Salvar snapshot ────────────────────────────────────────────────────
+    # ── 6. Alocação e evolução ────────────────────────────────────────────────
+    print("📊 Calculando alocação e evolução...")
+    alocacao = _alocacao_por_classe(df_rv, rf_liq)
+    df_mov_raw = _read(sh, "movimentacoes")
+    evolucao = _evolucao_patrimonio(df_mov_raw, rv_atual, rf_liq)
+    print(f"  ✅ Classes: {list(alocacao.keys())}")
+
+    # ── 7. Salvar snapshot ────────────────────────────────────────────────────
     print("💾 Salvando dashboard_snapshot...")
     agora = datetime.now().strftime("%Y-%m-%d %H:%M")
     linha = [
@@ -588,6 +662,8 @@ def main() -> None:
         json.dumps(mensal_juros),
         json.dumps(mensal_div),
         json.dumps(mensal_ir),
+        json.dumps(alocacao),
+        json.dumps(evolucao),
         agora,
     ]
 
