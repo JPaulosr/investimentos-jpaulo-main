@@ -499,8 +499,15 @@ def verificar_vencimentos(titulos: list, df_bcb: pd.DataFrame) -> None:
         print(f"  📨 {enviados} alerta(s) de vencimento enviado(s).")
 
 
-def _alocacao_por_classe(df_rv: pd.DataFrame, rf_liq: float) -> dict:
+def _alocacao_por_classe(df_rv: pd.DataFrame, rf_liq: float, titulos_rf: list) -> dict:
+    """
+    Monta alocação separando:
+    - RV por classe (FII, Ação) — Fiagro agrupa com FII
+    - RF separado em: Renda Fixa (CDB/LCI/LCA) e Tesouro Direto
+    """
     alocacao = {}
+
+    # ── Renda Variável ────────────────────────────────────────────────────────
     if not df_rv.empty:
         df = df_rv.copy()
         df.columns = [str(c).strip().lower() for c in df.columns]
@@ -508,11 +515,35 @@ def _alocacao_por_classe(df_rv: pd.DataFrame, rf_liq: float) -> dict:
         col_val = next((c for c in df.columns if "valor_mercado" in c), None)
         if col_cls and col_val:
             df["_val"] = df[col_val].apply(_to_float)
-            for cls, grp in df.groupby(col_cls):
-                alocacao[str(cls)] = round(grp["_val"].sum(), 2)
-    if rf_liq > 0:
+            df["_cls"] = df[col_cls].astype(str).str.strip()
+            # Agrupa Fiagro com FII
+            df["_cls"] = df["_cls"].replace({"Fiagro": "FII", "FIAGRO": "FII"})
+            for cls, grp in df.groupby("_cls"):
+                if cls and cls != "nan":
+                    alocacao[str(cls)] = round(grp["_val"].sum(), 2)
+
+    # ── Renda Fixa — separa Tesouro Direto ───────────────────────────────────
+    if titulos_rf and rf_liq > 0:
+        # Calcula proporção de cada tipo sobre o total aplicado
+        total_ap = sum(_to_float(t.get("valor_aplicado", 0)) for t in titulos_rf
+                       if str(t.get("observacao","")).strip() != "__DELETED__")
+        td_ap    = sum(_to_float(t.get("valor_aplicado", 0)) for t in titulos_rf
+                       if str(t.get("tipo","")).strip() == "Tesouro Direto"
+                       and str(t.get("observacao","")).strip() != "__DELETED__")
+        outros_ap = total_ap - td_ap
+
+        if total_ap > 0:
+            pct_td     = td_ap / total_ap
+            pct_outros = outros_ap / total_ap
+            alocacao["Tesouro Direto"] = round(rf_liq * pct_td, 2)
+            alocacao["Renda Fixa"]     = round(rf_liq * pct_outros, 2)
+        else:
+            alocacao["Renda Fixa"] = round(rf_liq, 2)
+    elif rf_liq > 0:
         alocacao["Renda Fixa"] = round(rf_liq, 2)
-    return alocacao
+
+    # Remove entradas zeradas
+    return {k: v for k, v in alocacao.items() if v > 0}
 
 
 def _evolucao_patrimonio(df_mov: pd.DataFrame, rv_atual_total: float, rf_liq: float) -> dict:
@@ -645,7 +676,7 @@ def main() -> None:
 
     # ── 6. Alocação e evolução ────────────────────────────────────────────────
     print("📊 Calculando alocação e evolução...")
-    alocacao = _alocacao_por_classe(df_rv, rf_liq)
+    alocacao = _alocacao_por_classe(df_rv, rf_liq, titulos_rf)
     df_mov_raw = _read(sh, "movimentacoes")
     evolucao = _evolucao_patrimonio(df_mov_raw, rv_atual, rf_liq)
     print(f"  ✅ Classes: {list(alocacao.keys())}")
