@@ -79,9 +79,13 @@ def _buscar_serie(serie: int, data_ini: date, data_fim: date) -> pd.DataFrame:
 
 
 def _conectar_sheets(sheet_id: str) -> gspread.Spreadsheet:
-    sa_raw = os.environ.get("GCP_SERVICE_ACCOUNT") or os.environ.get("GOOGLE_SERVICE_ACCOUNT")
+    sa_raw = (
+        os.environ.get("GCP_SERVICE_ACCOUNT_JSON")
+        or os.environ.get("GCP_SERVICE_ACCOUNT")
+        or os.environ.get("GOOGLE_SERVICE_ACCOUNT")
+    )
     if not sa_raw:
-        raise RuntimeError("Variável GCP_SERVICE_ACCOUNT não encontrada no ambiente.")
+        raise RuntimeError("Variável GCP_SERVICE_ACCOUNT_JSON não encontrada no ambiente.")
 
     sa_info = json.loads(sa_raw) if isinstance(sa_raw, str) else sa_raw
     creds   = Credentials.from_service_account_info(
