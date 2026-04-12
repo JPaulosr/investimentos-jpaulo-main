@@ -129,7 +129,7 @@ def _salvar(ws: gspread.Worksheet, df_novo: pd.DataFrame) -> None:
         ])
 
     ws.clear()
-    ws.update("A1", linhas, value_input_option="USER_ENTERED")
+    ws.update(linhas, "A1", value_input_option="USER_ENTERED")
     print(f"  💾 {len(linhas)-1} linhas gravadas em '{ABA_CACHE}'.")
 
 
