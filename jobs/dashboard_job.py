@@ -567,32 +567,54 @@ def _alocacao_por_classe(df_rv: pd.DataFrame, rf_liq: float, titulos_rf: list,
 
 def _breakdown_rf(titulos_rf: list, df_bcb: pd.DataFrame, ref: date) -> dict:
     """
-    Retorna breakdown calculado de TD vs CDB/LCI/LCA.
+    Retorna breakdown calculado de TD / CDB / LCI / LCA separados.
     Usa _calcular_titulo — nunca o valor_aplicado raw (pode estar corrompido).
     Formato: {
-        "td":     {"aplicado": X, "bruto": X, "liquido": X, "qtd": N},
-        "outros": {"aplicado": X, "bruto": X, "liquido": X, "qtd": N},
+        "td":  {"aplicado": X, "bruto": X, "liquido": X, "qtd": N},
+        "cdb": {"aplicado": X, "bruto": X, "liquido": X, "qtd": N},
+        "lci": {"aplicado": X, "bruto": X, "liquido": X, "qtd": N},
+        "lca": {"aplicado": X, "bruto": X, "liquido": X, "qtd": N},
     }
     """
-    td     = {"aplicado": 0.0, "bruto": 0.0, "liquido": 0.0, "qtd": 0}
-    outros = {"aplicado": 0.0, "bruto": 0.0, "liquido": 0.0, "qtd": 0}
+    buckets = {
+        "td":  {"aplicado": 0.0, "bruto": 0.0, "liquido": 0.0, "qtd": 0},
+        "cdb": {"aplicado": 0.0, "bruto": 0.0, "liquido": 0.0, "qtd": 0},
+        "lci": {"aplicado": 0.0, "bruto": 0.0, "liquido": 0.0, "qtd": 0},
+        "lca": {"aplicado": 0.0, "bruto": 0.0, "liquido": 0.0, "qtd": 0},
+    }
 
     for t in titulos_rf:
         obs  = str(t.get("observacao", "")).strip()
-        tipo = str(t.get("tipo", "")).strip()
+        tipo = str(t.get("tipo", "")).strip().upper()
         if obs == "__DELETED__":
             continue
         c = _calcular_titulo(t, df_bcb, ref)
         if not c or c["vencido"]:
             continue
-        bucket = td if tipo == "Tesouro Direto" else outros
-        bucket["aplicado"] += c["valor_aplicado"]
-        bucket["bruto"]    += c["valor_bruto"]
-        bucket["liquido"]  += c["valor_liquido"]
-        bucket["qtd"]      += 1
+        if tipo == "TESOURO DIRETO":
+            key = "td"
+        elif tipo == "LCI":
+            key = "lci"
+        elif tipo == "LCA":
+            key = "lca"
+        else:
+            key = "cdb"  # CDB e qualquer outro
+        buckets[key]["aplicado"] += c["valor_aplicado"]
+        buckets[key]["bruto"]    += c["valor_bruto"]
+        buckets[key]["liquido"]  += c["valor_liquido"]
+        buckets[key]["qtd"]      += 1
+
+    # "outros" = soma de cdb+lci+lca (compat. com versão anterior do frontend)
+    outros = {"aplicado": 0.0, "bruto": 0.0, "liquido": 0.0, "qtd": 0}
+    for k in ("cdb", "lci", "lca"):
+        for f in ("aplicado", "bruto", "liquido", "qtd"):
+            outros[f] += buckets[k][f]
 
     return {
-        "td":     {k: round(v, 2) for k, v in td.items()},
+        "td":     {k: round(v, 2) for k, v in buckets["td"].items()},
+        "cdb":    {k: round(v, 2) for k, v in buckets["cdb"].items()},
+        "lci":    {k: round(v, 2) for k, v in buckets["lci"].items()},
+        "lca":    {k: round(v, 2) for k, v in buckets["lca"].items()},
         "outros": {k: round(v, 2) for k, v in outros.items()},
     }
 
