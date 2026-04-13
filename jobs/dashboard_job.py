@@ -546,7 +546,15 @@ def _alocacao_por_classe(df_rv: pd.DataFrame, rf_liq: float, titulos_rf: list) -
     return {k: v for k, v in alocacao.items() if v > 0}
 
 
-def _evolucao_patrimonio(df_mov: pd.DataFrame, rv_atual_total: float, rf_liq: float) -> dict:
+def _evolucao_patrimonio(df_mov: pd.DataFrame, rv_atual_total: float, rf_liq: float, rf_ap_total: float = 0.0) -> dict:
+    """
+    Calcula evolução do patrimônio mês a mês (13 meses).
+    
+    - investido: compras RV acumuladas até o mês + rf_ap_total (valor aplicado RF)
+    - atual: para mês corrente usa rv_atual + rf_liq; para meses anteriores usa investido
+      (não temos histórico de cotações passadas)
+    - ganho = atual - investido (só faz sentido no mês corrente)
+    """
     if df_mov.empty:
         return {}
     df = df_mov.copy()
@@ -575,11 +583,19 @@ def _evolucao_patrimonio(df_mov: pd.DataFrame, rv_atual_total: float, rf_liq: fl
         mes_fim = prox - timedelta(days=1)
         chave = date(y, m, 1).strftime("%Y-%m")
         df_ate   = df[df["_data"] <= mes_fim]
-        compras  = df_ate[df_ate["_tipo"].isin(["COMPRA","C","BUY"])]["_val"].sum()
+        compras  = df_ate[df_ate["_tipo"].isin(["COMPRA","C","BUY","BONIFICAÇÃO EM ATIVOS"])]["_val"].sum()
         vendas   = df_ate[df_ate["_tipo"].isin(["VENDA","V","SELL"])]["_val"].sum()
-        investido = max(0.0, compras - vendas)
-        atual = (rv_atual_total + rf_liq) if i == 0 else investido
-        evolucao[chave] = {"investido": round(investido, 2), "atual": round(atual, 2)}
+        rv_investido = max(0.0, compras - vendas)
+        # ✅ investido total = RV + RF (aplicado fixo, não varia mês a mês no histórico)
+        investido_total = rv_investido + rf_ap_total
+        if i == 0:
+            # Mês atual: usa valores reais de mercado
+            atual = rv_atual_total + rf_liq
+        else:
+            # Meses anteriores: não temos cotações históricas,
+            # usa investido como proxy (ganho aparece só no mês atual)
+            atual = investido_total
+        evolucao[chave] = {"investido": round(investido_total, 2), "atual": round(atual, 2)}
     return evolucao
 
 
@@ -678,7 +694,7 @@ def main() -> None:
     print("📊 Calculando alocação e evolução...")
     alocacao = _alocacao_por_classe(df_rv, rf_liq, titulos_rf)
     df_mov_raw = _read(sh, "movimentacoes")
-    evolucao = _evolucao_patrimonio(df_mov_raw, rv_atual, rf_liq)
+    evolucao = _evolucao_patrimonio(df_mov_raw, rv_atual, rf_liq, rf_ap)
     print(f"  ✅ Classes: {list(alocacao.keys())}")
 
     # ── 7. Salvar snapshot ────────────────────────────────────────────────────
