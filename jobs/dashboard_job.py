@@ -570,7 +570,7 @@ def _evolucao_patrimonio(df_mov: pd.DataFrame, rv_atual_total: float, rf_liq: fl
     df = df.dropna(subset=["_data"])
     hoje = date.today()
     evolucao = {}
-    for i in range(12, -1, -1):
+    for i in range(47, -1, -1):  # 48 meses (~4 anos) para cobrir histórico completo
         m = hoje.month - i
         y = hoje.year
         while m <= 0:
