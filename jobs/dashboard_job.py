@@ -60,6 +60,8 @@ HEADER_SNAPSHOT = [
     # Alocação por classe e evolução mensal (JSON)
     "alocacao_classes",
     "evolucao_patrimonio",
+    # Breakdown RF: TD vs CDB/LCI/LCA (valores calculados, não raw da planilha)
+    "breakdown_rf",          # JSON: {"td": {...}, "outros": {...}}
     # Meta
     "atualizado_em",
 ]
@@ -499,12 +501,21 @@ def verificar_vencimentos(titulos: list, df_bcb: pd.DataFrame) -> None:
         print(f"  📨 {enviados} alerta(s) de vencimento enviado(s).")
 
 
-def _alocacao_por_classe(df_rv: pd.DataFrame, rf_liq: float, titulos_rf: list) -> dict:
+def _alocacao_por_classe(df_rv: pd.DataFrame, rf_liq: float, titulos_rf: list,
+                         df_bcb: pd.DataFrame = None, ref: date = None) -> dict:
     """
     Monta alocação separando:
     - RV por classe (FII, Ação) — Fiagro agrupa com FII
     - RF separado em: Renda Fixa (CDB/LCI/LCA) e Tesouro Direto
+
+    Usa valores CALCULADOS (_calcular_titulo) para TD e CDB — não o valor_aplicado
+    raw da planilha, que pode estar corrompido (ex: quantidade × preço em vez de R$).
     """
+    if df_bcb is None:
+        df_bcb = pd.DataFrame()
+    if ref is None:
+        ref = date.today()
+
     alocacao = {}
 
     # ── Renda Variável ────────────────────────────────────────────────────────
@@ -522,28 +533,68 @@ def _alocacao_por_classe(df_rv: pd.DataFrame, rf_liq: float, titulos_rf: list) -
                 if cls and cls != "nan":
                     alocacao[str(cls)] = round(grp["_val"].sum(), 2)
 
-    # ── Renda Fixa — separa Tesouro Direto ───────────────────────────────────
+    # ── Renda Fixa — separa Tesouro Direto usando valores CALCULADOS ──────────
     if titulos_rf and rf_liq > 0:
-        # Calcula proporção de cada tipo sobre o total aplicado
-        total_ap = sum(_to_float(t.get("valor_aplicado", 0)) for t in titulos_rf
-                       if str(t.get("observacao","")).strip() != "__DELETED__")
-        td_ap    = sum(_to_float(t.get("valor_aplicado", 0)) for t in titulos_rf
-                       if str(t.get("tipo","")).strip() == "Tesouro Direto"
-                       and str(t.get("observacao","")).strip() != "__DELETED__")
-        outros_ap = total_ap - td_ap
+        td_liq     = 0.0
+        outros_liq = 0.0
 
-        if total_ap > 0:
-            pct_td     = td_ap / total_ap
-            pct_outros = outros_ap / total_ap
-            alocacao["Tesouro Direto"] = round(rf_liq * pct_td, 2)
-            alocacao["Renda Fixa"]     = round(rf_liq * pct_outros, 2)
-        else:
+        for t in titulos_rf:
+            obs  = str(t.get("observacao", "")).strip()
+            tipo = str(t.get("tipo", "")).strip()
+            if obs == "__DELETED__":
+                continue
+            c = _calcular_titulo(t, df_bcb, ref)
+            if not c or c["vencido"]:
+                continue
+            if tipo == "Tesouro Direto":
+                td_liq += c["valor_liquido"]
+            else:
+                outros_liq += c["valor_liquido"]
+
+        if td_liq > 0:
+            alocacao["Tesouro Direto"] = round(td_liq, 2)
+        if outros_liq > 0:
+            alocacao["Renda Fixa"] = round(outros_liq, 2)
+        # fallback: se nenhum calculou mas rf_liq existe
+        if td_liq == 0 and outros_liq == 0:
             alocacao["Renda Fixa"] = round(rf_liq, 2)
     elif rf_liq > 0:
         alocacao["Renda Fixa"] = round(rf_liq, 2)
 
     # Remove entradas zeradas
     return {k: v for k, v in alocacao.items() if v > 0}
+
+
+def _breakdown_rf(titulos_rf: list, df_bcb: pd.DataFrame, ref: date) -> dict:
+    """
+    Retorna breakdown calculado de TD vs CDB/LCI/LCA.
+    Usa _calcular_titulo — nunca o valor_aplicado raw (pode estar corrompido).
+    Formato: {
+        "td":     {"aplicado": X, "bruto": X, "liquido": X, "qtd": N},
+        "outros": {"aplicado": X, "bruto": X, "liquido": X, "qtd": N},
+    }
+    """
+    td     = {"aplicado": 0.0, "bruto": 0.0, "liquido": 0.0, "qtd": 0}
+    outros = {"aplicado": 0.0, "bruto": 0.0, "liquido": 0.0, "qtd": 0}
+
+    for t in titulos_rf:
+        obs  = str(t.get("observacao", "")).strip()
+        tipo = str(t.get("tipo", "")).strip()
+        if obs == "__DELETED__":
+            continue
+        c = _calcular_titulo(t, df_bcb, ref)
+        if not c or c["vencido"]:
+            continue
+        bucket = td if tipo == "Tesouro Direto" else outros
+        bucket["aplicado"] += c["valor_aplicado"]
+        bucket["bruto"]    += c["valor_bruto"]
+        bucket["liquido"]  += c["valor_liquido"]
+        bucket["qtd"]      += 1
+
+    return {
+        "td":     {k: round(v, 2) for k, v in td.items()},
+        "outros": {k: round(v, 2) for k, v in outros.items()},
+    }
 
 
 def _evolucao_patrimonio(df_mov: pd.DataFrame, rv_atual_total: float, rf_liq: float, rf_ap_total: float = 0.0) -> dict:
@@ -692,7 +743,8 @@ def main() -> None:
 
     # ── 6. Alocação e evolução ────────────────────────────────────────────────
     print("📊 Calculando alocação e evolução...")
-    alocacao = _alocacao_por_classe(df_rv, rf_liq, titulos_rf)
+    alocacao = _alocacao_por_classe(df_rv, rf_liq, titulos_rf, df_bcb, hoje)
+    breakdown_rf = _breakdown_rf(titulos_rf, df_bcb, hoje)
     df_mov_raw = _read(sh, "movimentacoes")
     evolucao = _evolucao_patrimonio(df_mov_raw, rv_atual, rf_liq, rf_ap)
     print(f"  ✅ Classes: {list(alocacao.keys())}")
@@ -711,6 +763,7 @@ def main() -> None:
         json.dumps(mensal_ir),
         json.dumps(alocacao),
         json.dumps(evolucao),
+        json.dumps(breakdown_rf),
         agora,
     ]
 
