@@ -395,6 +395,17 @@ def _send_telegram(msg: str) -> None:
     except Exception as e:
         print(f"⚠️ Telegram exception: {e}")
 
+
+def _log_alert_hash(ws_logs, event_hash: str, ticker: str, tipo: str, status: str) -> None:
+    """Persiste hashes de alertas consolidados no alerts_log.
+    Isso evita duplicidade quando GitHub e VPS rodam no mesmo dia.
+    """
+    try:
+        if ws_logs is not None and event_hash:
+            ws_logs.append_row([_now_iso_min(), event_hash, ticker, tipo, status], value_input_option="RAW")
+    except Exception as e:
+        print(f"⚠️ Não consegui gravar hash do alerta no alerts_log: {e}")
+
 # =============================================================================
 # META (ativos_master) — logo_url / tipo_ativo / classificacao / pvp
 # =============================================================================
@@ -882,6 +893,7 @@ def run() -> None:
             )
             _send_telegram(msg_pre)
             hashes_enviados.add(hday)
+            _log_alert_hash(ws_logs, hday, "PAYDAY", "PAYDAY_PRE", "ENVIADO")
             print(f"📬 Alerta PAYDAY enviado: {len(agg_pre)} ativos | R$ {_fmt_money_br(sum(agg_pre.values()))}")
 
     # Busca real dos eventos anunciados a partir do scraper
@@ -1298,6 +1310,7 @@ def run() -> None:
             )
             _send_telegram(msg2)
             hashes_enviados.add(hday)
+            _log_alert_hash(ws_logs, hday, "PAYDAY", "PAYDAY", "ENVIADO")
 
     print(f"✅ Inseridos: {inserted}")
     print(f"🔁 Atualizados: {updated}")
