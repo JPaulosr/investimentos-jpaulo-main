@@ -1,4 +1,4 @@
-name: Robô Proventos + Dashboard + BCB (Diário)
+name: Robô Proventos + Dashboard + BCB + Radar (Diário)
 
 on:
   schedule:
@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       job:
-        description: "Qual job rodar (all | proventos | dashboard | bcb)"
+        description: "Qual job rodar (all | proventos | dashboard | bcb | radar)"
         required: false
         default: "all"
 
@@ -56,3 +56,15 @@ jobs:
           TELEGRAM_CHAT_ID:      ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python jobs/dashboard_job.py
+
+      - name: 4. Radar de Oportunidades
+        if: ${{ github.event.inputs.job == 'all' || github.event.inputs.job == 'radar' || github.event_name == 'schedule' }}
+        env:
+          GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
+          GCP_SERVICE_ACCOUNT:      ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
+          SHEET_ID_NOVO:            ${{ secrets.SHEET_ID_NOVO }}
+          TELEGRAM_BOT_TOKEN:       ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_TOKEN:           ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:         ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python jobs/radar_job.py
